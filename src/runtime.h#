@@ -1,0 +1,820 @@
+mod util
+mod jx
+mod digest
+mod reference
+mod store
+mod image
+mod spec
+mod cgroup
+mod network
+
+;; ── Options ──────────────────────────────────────────────────────────────────
+;; A flat list of key=value entries. Single keys replace, `opt_add` keys repeat.
+;;
+;;   image name hostname workdir user network memory cpus pids shares runtime
+;;   entrypoint(+) arg(+) env(+) volume(+) publish(+) cap_add(+) cap_drop(+) label(+)
+;;   readonly privileged userns rm rootfs_dir
+
+pub struct Options is
+    pub op_kv: [string]
+end
+
+pub fn options(image_ref: string) -> Options is
+    return Options { op_kv: ["image=" + image_ref] }
+end
+
+fn kv_key(e: string) -> string is
+    return util::head_before(e, "=")
+end
+
+pub fn opt(o: Options, key: string, value: string) -> Options is
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < array_len(o.op_kv) is
+        if kv_key(o.op_kv[i]) != key is out = array_push(out, o.op_kv[i]) end
+        i += 1
+    end
+    out = array_push(out, key + "=" + value)
+    return Options { op_kv: out }
+end
+
+pub fn opt_add(o: Options, key: string, value: string) -> Options is
+    return Options { op_kv: array_push(o.op_kv, key + "=" + value) }
+end
+
+pub fn opt_all(o: Options, key: string) -> [string] is
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < array_len(o.op_kv) is
+        if kv_key(o.op_kv[i]) == key is out = array_push(out, util::tail_after(o.op_kv[i], "=")) end
+        i += 1
+    end
+    return out
+end
+
+pub fn opt_get(o: Options, key: string) -> string is
+    let all: [string] = opt_all(o, key)
+    if array_len(all) == 0 is return "" end
+    return all[array_len(all) - 1]
+end
+
+pub fn opt_has(o: Options, key: string) -> bool is
+    return array_len(opt_all(o, key)) > 0
+end
+
+pub fn opt_flag(o: Options, key: string) -> bool is
+    let v: string = opt_get(o, key)
+    return v == "true" || v == "1" || v == "yes"
+end
+
+;; ── Container records ────────────────────────────────────────────────────────
+
+pub struct ContainerInfo is
+    pub ci_id:      string
+    pub ci_name:    string
+    pub ci_image:   string
+    pub ci_status:  string
+    pub ci_pid:     int
+    pub ci_exit:    int
+    pub ci_created: string
+    pub ci_command: string
+    pub ci_ip:      string
+end
+
+pub fn dir_of(s: store::Store, id: string) -> string is
+    return store::containers_dir(s) + "/" + id
+end
+
+pub fn state_get(s: store::Store, id: string, key: string) -> string is
+    let ls: [string] = util::lines(util::read(dir_of(s, id) + "/state"))
+    let mut i: int = 0
+    while i < array_len(ls) is
+        if kv_key(ls[i]) == key is return util::tail_after(ls[i], "=") end
+        i += 1
+    end
+    return ""
+end
+
+pub fn state_set(s: store::Store, id: string, key: string, value: string) is
+    let clean: string = string_replace(value, "\n", " ")
+    let ls: [string] = util::lines(util::read(dir_of(s, id) + "/state"))
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < array_len(ls) is
+        if kv_key(ls[i]) != key is out = array_push(out, ls[i]) end
+        i += 1
+    end
+    out = array_push(out, key + "=" + clean)
+    util::write_file(dir_of(s, id) + "/state", util::join(out, "\n") + "\n")
+end
+
+fn valid_name(n: string) -> bool is
+    if n == "" || string_len(n) > 128 is return false end
+    let first: string = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    let rest: string = first + "_.-"
+    if string_find(first, string_at(n, 0)) < 0 is return false end
+    let mut i: int = 1
+    while i < string_len(n) is
+        if string_find(rest, string_at(n, i)) < 0 is return false end
+        i += 1
+    end
+    return true
+end
+
+pub fn ids(s: store::Store) -> [string] is
+    return util::lines(util::capture("ls -1 " + util::sq(store::containers_dir(s)) + " 2>/dev/null"))
+end
+
+;; Resolves a container id, unique id prefix or name; "" when unknown.
+pub fn find(s: store::Store, ref_text: string) -> string is
+    let t: string = string_trim(ref_text)
+    if t == "" is return "" end
+    let all: [string] = ids(s)
+    let mut i: int = 0
+    while i < array_len(all) is
+        if all[i] == t || state_get(s, all[i], "name") == t is return all[i] end
+        i += 1
+    end
+    if util::is_hex(t) is
+        let mut hit: string = ""
+        let mut n: int = 0
+        let mut j: int = 0
+        while j < array_len(all) is
+            if string_starts_with(all[j], t) is
+                hit = all[j]
+                n += 1
+            end
+            j += 1
+        end
+        if n == 1 is return hit end
+    end
+    return ""
+end
+
+fn wait_for_file(path: string, tries: int) -> bool is
+    let mut i: int = 0
+    while i < tries is
+        if util::exists(path) is return true end
+        util::quiet("sleep 0.1")
+        i += 1
+    end
+    return false
+end
+
+fn pid_alive(pid: int) -> bool is
+    if pid <= 0 is return false end
+    return util::quiet("kill -0 " + to_string(pid)) == 0
+end
+
+pub fn pid_of(s: store::Store, id: string) -> int is
+    return util::atoi(util::read_trim(dir_of(s, id) + "/pid"))
+end
+
+pub fn exit_code(s: store::Store, id: string) -> int is
+    let t: string = util::read_trim(dir_of(s, id) + "/exit")
+    if t == "" is return 0 - 1 end
+    return util::atoi(t)
+end
+
+;; Releases everything a stopped container still holds (network, cgroup). Idempotent.
+fn release(s: store::Store, id: string) is
+    let d: string = dir_of(s, id)
+    if util::exists(d + "/released") is return end
+    let ip: string = state_get(s, id, "ip")
+    let net: string = state_get(s, id, "network")
+    if net == "bridge" is network::teardown(s, id, ip, util::csv(state_get(s, id, "publish"))) end
+    if cgroup::exists(id) is
+        cgroup::kill_all(id)
+        cgroup::remove(id)
+    end
+    util::quiet("rm -rf " + util::sq(d + "/rootfs/.po"))
+    util::write_file(d + "/released", "1\n")
+end
+
+;; created | running | exited | unknown
+pub fn status(s: store::Store, id: string) -> string is
+    let d: string = dir_of(s, id)
+    if !util::is_dir(d) is return "unknown" end
+    if !util::exists(d + "/started") is return "created" end
+    if util::exists(d + "/exit") is
+        release(s, id)
+        return "exited"
+    end
+    if pid_alive(pid_of(s, id)) is return "running" end
+    if util::exists(d + "/pid") is
+        if wait_for_file(d + "/exit", 15) is
+            release(s, id)
+            return "exited"
+        end
+        util::write_file(d + "/exit", "137\n")
+        release(s, id)
+        return "exited"
+    end
+    return "created"
+end
+
+pub fn info(s: store::Store, id: string) -> ContainerInfo is
+    return ContainerInfo { ci_id: id, ci_name: state_get(s, id, "name"), ci_image: state_get(s, id, "image_name"), ci_status: status(s, id), ci_pid: pid_of(s, id), ci_exit: exit_code(s, id), ci_created: state_get(s, id, "created"), ci_command: state_get(s, id, "command"), ci_ip: state_get(s, id, "ip") }
+end
+
+pub fn list(s: store::Store) -> [ContainerInfo] is
+    let mut out: [ContainerInfo] = []
+    let all: [string] = ids(s)
+    let mut i: int = 0
+    while i < array_len(all) is
+        out = array_push(out, info(s, all[i]))
+        i += 1
+    end
+    return out
+end
+
+pub fn inspect(s: store::Store, id: string) -> string is
+    let c: ContainerInfo = info(s, id)
+    let d: string = dir_of(s, id)
+    return jx::obj([jx::kv("Id", jx::q(id)), jx::kv("Name", jx::q(c.ci_name)), jx::kv("Image", jx::q(c.ci_image)), jx::kv("ImageId", jx::q(state_get(s, id, "image"))), jx::kv("Created", jx::q(c.ci_created)), jx::kv("Status", jx::q(c.ci_status)), jx::kv("Pid", to_string(c.ci_pid)), jx::kv("ExitCode", to_string(c.ci_exit)), jx::kv("StartedAt", jx::q(util::read_trim(d + "/started"))), jx::kv("FinishedAt", jx::q(util::read_trim(d + "/finished"))), jx::kv("IPAddress", jx::q(c.ci_ip)), jx::kv("Network", jx::q(state_get(s, id, "network"))), jx::kv("Command", jx::q(c.ci_command)), jx::kv("Bundle", jx::q(d)), jx::kv("Spec", util::read(d + "/config.json"))])
+end
+
+pub fn logs(s: store::Store, id: string) -> string is
+    return util::read(dir_of(s, id) + "/console.log")
+end
+
+pub fn logs_tail(s: store::Store, id: string, n: int) -> string is
+    return util::capture("tail -n " + to_string(n) + " " + util::sq(dir_of(s, id) + "/console.log") + " 2>/dev/null")
+end
+
+;; ── Create ───────────────────────────────────────────────────────────────────
+
+;; KEY=value lists: `extra` entries replace those of `base` with the same key.
+pub fn merge_env(base: [string], extra: [string]) -> [string] is
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < array_len(base) is
+        let k: string = kv_key(base[i])
+        let mut replaced: bool = false
+        let mut j: int = 0
+        while j < array_len(extra) is
+            if kv_key(extra[j]) == k is replaced = true end
+            j += 1
+        end
+        if !replaced is out = array_push(out, base[i]) end
+        i += 1
+    end
+    return array_concat(out, extra)
+end
+
+fn env_has(env: [string], key: string) -> bool is
+    let mut i: int = 0
+    while i < array_len(env) is
+        if kv_key(env[i]) == key is return true end
+        i += 1
+    end
+    return false
+end
+
+;; "0.5" / "2" / "1.25" CPUs -> microseconds of CPU time per 100ms period (0 = unlimited).
+pub fn cpus_to_quota(cpus: string) -> int is
+    let t: string = string_trim(cpus)
+    if t == "" is return 0 end
+    let whole: int = util::atoi(util::head_before(t, "."))
+    let mut frac: string = util::tail_after(t, ".")
+    if !string_contains(t, ".") is frac = "" end
+    frac = string_slice(frac + "00000", 0, 5)
+    return whole * 100000 + util::atoi(frac)
+end
+
+;; Find the directory of an image layer holding `rel`, searching from the top layer down.
+fn layer_with(s: store::Store, chains: [string], rel: string) -> string is
+    let mut i: int = array_len(chains) - 1
+    while i >= 0 is
+        let d: string = store::layers_dir(s) + "/" + chains[i] + "/diff"
+        if util::exists(d + "/" + rel) is return d end
+        i -= 1
+    end
+    return ""
+end
+
+;; A directory with /etc/passwd and /etc/group of the image, for resolving user names.
+fn user_view(s: store::Store, chains: [string], mode: string, rootfs: string) -> string is
+    if mode != "overlay" is return rootfs end
+    let tmp: string = store::scratch(s, "users")
+    util::mkdir_p(tmp + "/etc")
+    let p: string = layer_with(s, chains, "etc/passwd")
+    if p != "" is util::quiet("cp " + util::sq(p + "/etc/passwd") + " " + util::sq(tmp + "/etc/passwd")) end
+    let g: string = layer_with(s, chains, "etc/group")
+    if g != "" is util::quiet("cp " + util::sq(g + "/etc/group") + " " + util::sq(tmp + "/etc/group")) end
+    return tmp
+end
+
+fn home_of(view: string, uid: string) -> string is
+    let ls: [string] = util::lines(util::read(view + "/etc/passwd"))
+    let mut i: int = 0
+    while i < array_len(ls) is
+        let f: [string] = string_split(ls[i], ":")
+        if array_len(f) >= 6 && f[2] == uid is return f[5] end
+        i += 1
+    end
+    if uid == "0" is return "/root" end
+    return "/"
+end
+
+fn volume_dir(s: store::Store, name: string) -> string is
+    return s.st_root + "/volumes/" + name
+end
+
+;; Expands "name:/dest" (named volume) into an absolute bind source.
+fn normalize_volume(s: store::Store, v: string) -> string is
+    let src: string = util::head_before(v, ":")
+    if string_starts_with(src, "/") || !string_contains(v, ":") is return v end
+    let dir: string = volume_dir(s, src)
+    util::mkdir_p(dir)
+    return dir + ":" + util::tail_after(v, ":")
+end
+
+;; Creates a container from the options. Returns its id, or "" (with a message on stderr).
+pub fn create(s: store::Store, o: Options) -> string is
+    let direct: string = opt_get(o, "rootfs_dir")
+    let mut image_id: string = ""
+    let mut cfg: image::ImageConfig = image::new_config()
+    let mut chains: [string] = []
+    let mut image_name: string = opt_get(o, "image")
+    if direct == "" is
+        image_id = image::resolve(s, opt_get(o, "image"))
+        if image_id == "" is
+            util::eprint("create: no such image: " + opt_get(o, "image"))
+            return ""
+        end
+        cfg = image::config_of(s, image_id)
+        chains = image::layer_chains(s, image_id)
+        let names: [string] = image::names_of(s, image_id)
+        if array_len(names) > 0 is image_name = reference::familiar(reference::parse(names[0])) end
+    end
+    let name: string = opt_get(o, "name")
+    if name != "" is
+        if !valid_name(name) is
+            util::eprint("create: invalid container name '" + name + "'")
+            return ""
+        end
+        if find(s, name) != "" is
+            util::eprint("create: the name '" + name + "' is already in use")
+            return ""
+        end
+    end
+    let net: string = util::or_default(opt_get(o, "network"), if network::available() then "bridge" else "host")
+    if !network::valid_mode(net) is
+        util::eprint("create: unknown network mode '" + net + "' (host, none, bridge)")
+        return ""
+    end
+    if net == "bridge" && !network::available() is
+        util::eprint("create: bridge networking needs root and the `ip` tool")
+        return ""
+    end
+
+    let mut entry: [string] = cfg.ic_entrypoint
+    let mut cmd: [string] = cfg.ic_cmd
+    if opt_has(o, "entrypoint") is
+        entry = opt_all(o, "entrypoint")
+        if array_len(entry) == 1 && entry[0] == "" is entry = [] end
+        cmd = []
+    end
+    if opt_has(o, "arg") is cmd = opt_all(o, "arg") end
+    let args: [string] = array_concat(entry, cmd)
+    if array_len(args) == 0 is
+        util::eprint("create: the image has no command; pass one")
+        return ""
+    end
+
+    let id: string = util::rand_hex(32)
+    let d: string = dir_of(s, id)
+    util::mkdir_p(d)
+    let mode: string = if direct != "" then "dir" else s.st_driver
+    let mut rootfs: string = d + "/rootfs"
+    if mode == "dir" is
+        rootfs = direct
+    else if mode == "vfs" is
+        let mut top: string = d + "/empty"
+        if array_len(chains) > 0 is top = store::layers_dir(s) + "/" + chains[array_len(chains) - 1] + "/diff" else is util::mkdir_p(top) end
+        if util::quiet("cp -a --reflink=auto " + util::sq(top) + " " + util::sq(rootfs)) != 0 is
+            util::eprint("create: cannot prepare the root filesystem")
+            util::rm_rf(d)
+            return ""
+        end
+    else is
+        util::mkdir_p(rootfs)
+        util::mkdir_p(d + "/upper")
+        util::mkdir_p(d + "/work")
+    end
+
+    let view: string = user_view(s, chains, mode, rootfs)
+    let user_in: string = util::or_default(opt_get(o, "user"), cfg.ic_user)
+    let user: string = spec::resolve_user(view, user_in)
+    let uid: string = util::head_before(user, ":")
+    let hostname: string = util::or_default(opt_get(o, "hostname"), string_slice(id, 0, 12))
+    let mut env: [string] = merge_env(cfg.ic_env, opt_all(o, "env"))
+    if !env_has(env, "PATH") is env = array_push(env, "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin") end
+    if !env_has(env, "HOME") is env = array_push(env, "HOME=" + home_of(view, uid)) end
+    env = merge_env(env, ["HOSTNAME=" + hostname])
+    if mode == "overlay" is util::rm_rf(view) end
+
+    let mut sp: spec::Spec = spec::new_spec(rootfs)
+    sp.sp_args = args
+    sp.sp_env = env
+    sp.sp_cwd = util::or_default(opt_get(o, "workdir"), util::or_default(cfg.ic_workdir, "/"))
+    sp.sp_user = user
+    sp.sp_hostname = hostname
+    sp.sp_readonly = opt_flag(o, "readonly")
+    let mut vols: [string] = []
+    let vopts: [string] = opt_all(o, "volume")
+    let mut vi: int = 0
+    while vi < array_len(vopts) is
+        vols = array_push(vols, normalize_volume(s, vopts[vi]))
+        vi += 1
+    end
+    sp.sp_mounts = vols
+    let privileged: bool = opt_flag(o, "privileged")
+    if !privileged is
+        sp.sp_caps = spec::adjust_caps(spec::default_caps(), opt_all(o, "cap_add"), opt_all(o, "cap_drop"))
+    else is
+        sp.sp_caps = []
+        sp.sp_no_new_privs = false
+    end
+    let rootless: bool = !util::is_root()
+    let mut nss: [string] = spec::default_namespaces()
+    if net != "host" is nss = array_push(nss, "network") end
+    if opt_flag(o, "userns") || rootless is nss = array_push(nss, "user") end
+    sp.sp_namespaces = nss
+    sp.sp_mem = util::parse_size(opt_get(o, "memory"))
+    sp.sp_cpu_quota = cpus_to_quota(opt_get(o, "cpus"))
+    sp.sp_pids = util::atoi(opt_get(o, "pids"))
+    util::write_file(d + "/config.json", spec::to_json(sp))
+
+    util::mkdir_p(d + "/etc")
+    util::write_file(d + "/etc/hostname", hostname + "\n")
+    util::write_file(d + "/etc/resolv.conf", network::resolv_conf())
+    util::write_file(d + "/etc/hosts", network::hosts_file("", hostname))
+
+    util::write_file(d + "/state", "")
+    state_set(s, id, "id", id)
+    if name != "" is state_set(s, id, "name", name) end
+    state_set(s, id, "image", image_id)
+    state_set(s, id, "image_name", image_name)
+    state_set(s, id, "created", util::now_iso())
+    state_set(s, id, "mode", mode)
+    state_set(s, id, "network", net)
+    state_set(s, id, "publish", util::join(opt_all(o, "publish"), ","))
+    state_set(s, id, "command", util::join(args, " "))
+    state_set(s, id, "privileged", if privileged then "1" else "0")
+    state_set(s, id, "shares", util::or_default(opt_get(o, "shares"), "0"))
+    state_set(s, id, "rootless", if rootless then "1" else "0")
+    write_scripts(s, id, sp, chains, mode, net, privileged)
+    return id
+end
+
+;; ── Script generation ────────────────────────────────────────────────────────
+
+fn sh_quote_list(items: [string]) -> string is
+    let mut parts: [string] = []
+    let mut i: int = 0
+    while i < array_len(items) is
+        parts = array_push(parts, util::sq(items[i]))
+        i += 1
+    end
+    return util::join(parts, " ")
+end
+
+;; Host-side command that detaches `/` of the old root once we have pivoted (see init.sh).
+;; After pivot_root the host's binaries only exist below /.po, so the dynamic loader of the
+;; host is invoked from there with an explicit library path.
+fn lazy_umount_cmd() -> string is
+    let bin: string = util::capture("command -v umount")
+    let deps: string = util::capture("ldd " + util::sq(bin) + " 2>&1")
+    if string_contains(deps, "not a dynamic") || deps == "" is
+        return "/.po" + bin + " -l /.po"
+    end
+    let ls: [string] = util::lines(deps)
+    let mut loader: string = ""
+    let mut dirs: [string] = []
+    let mut i: int = 0
+    while i < array_len(ls) is
+        let l: string = ls[i]
+        let idx: int = string_find(l, "/")
+        if idx >= 0 is
+            let rest: string = string_slice(l, idx, string_len(l))
+            let path: string = util::head_before(rest, " ")
+            if string_contains(l, "=>") is
+                let d: string = "/.po" + util::dirname(path)
+                if !util::has(dirs, d) is dirs = array_push(dirs, d) end
+            else is
+                loader = path
+            end
+        end
+        i += 1
+    end
+    if loader == "" is return "/.po" + bin + " -l /.po" end
+    return "/.po" + loader + " --library-path " + util::join(dirs, ":") + " /.po" + bin + " -l /.po"
+end
+
+fn host_path() -> string is
+    return "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+end
+
+;; Absolute path of a host tool ("" when missing).
+fn tool_path(name: string) -> string is
+    return util::capture("command -v " + util::sq(name))
+end
+
+;; `setpriv ... --` for PID 1 (empty when setpriv is missing: no privilege drop).
+fn setpriv_prefix(sp: spec::Spec, privileged: bool) -> string is
+    let sp_bin: string = tool_path("setpriv")
+    if sp_bin == "" is
+        util::eprint("warning: `setpriv` not found - capabilities are not dropped and no_new_privs is not set")
+        return ""
+    end
+    let uid: int = spec::uid_of(sp.sp_user)
+    let gid: int = spec::gid_of(sp.sp_user)
+    let mut p: string = sp_bin + " --reuid " + to_string(uid) + " --regid " + to_string(gid) + " --clear-groups"
+    if sp.sp_no_new_privs is p = p + " --no-new-privs" end
+    if !privileged is
+        let mut keep: [string] = ["-all"]
+        let mut i: int = 0
+        while i < array_len(sp.sp_caps) is
+            keep = array_push(keep, "+" + spec::cap_short(sp.sp_caps[i]))
+            i += 1
+        end
+        p = p + " --bounding-set " + util::join(keep, ",") + " --inh-caps -all"
+    end
+    return p + " -- "
+end
+
+;; Stage A of init.sh: everything that needs full privileges (mounts, pivot_root).
+;; Runs as a background child of PID 1 and reports "ok" / "fail" through fd 4.
+fn stage_a(s: store::Store, id: string, sp: spec::Spec, chains: [string], mode: string, net: string, privileged: bool) -> [string] is
+    let d: string = dir_of(s, id)
+    let rootless: bool = !util::is_root()
+    let mut a: [string] = ["h mount --make-rprivate /"]
+    if mode == "overlay" is
+        let mut lowers: [string] = []
+        let mut i: int = array_len(chains) - 1
+        while i >= 0 is
+            lowers = array_push(lowers, store::layers_dir(s) + "/" + chains[i] + "/diff")
+            i -= 1
+        end
+        a = array_push(a, "h mount -t overlay overlay -o lowerdir=" + util::join(lowers, ":") + ",upperdir=" + d + "/upper,workdir=" + d + "/work \"$ROOT\"")
+    else is
+        a = array_push(a, "h mount --bind \"$ROOT\" \"$ROOT\"")
+    end
+    a = array_push(a, "h mkdir -p \"$ROOT/etc\" \"$ROOT/proc\" \"$ROOT/sys\" \"$ROOT/dev\" \"$ROOT/tmp\"")
+    let etc: [string] = ["hosts", "hostname", "resolv.conf"]
+    let mut e: int = 0
+    while e < array_len(etc) is
+        a = array_push(a, "[ -e \"$ROOT/etc/" + etc[e] + "\" ] || : > \"$ROOT/etc/" + etc[e] + "\"")
+        a = array_push(a, "h mount --bind \"$CD/etc/" + etc[e] + "\" \"$ROOT/etc/" + etc[e] + "\"")
+        e += 1
+    end
+    let mut v: int = 0
+    while v < array_len(sp.sp_mounts) is
+        let m: string = sp.sp_mounts[v]
+        let src: string = spec::mount_source(m)
+        let dst: string = spec::mount_dest(m)
+        a = array_push(a, "if [ -d " + util::sq(src) + " ]; then h mkdir -p \"$ROOT\"" + util::sq(dst) + "; else h mkdir -p \"$ROOT\"" + util::sq(util::dirname(dst)) + "; : > \"$ROOT\"" + util::sq(dst) + "; fi")
+        a = array_push(a, "h mount --rbind " + util::sq(src) + " \"$ROOT\"" + util::sq(dst))
+        if spec::mount_readonly(m) is a = array_push(a, "h mount -o remount,bind,ro \"$ROOT\"" + util::sq(dst)) end
+        v += 1
+    end
+    a = array_push(a, "h mount -t proc proc \"$ROOT/proc\"")
+    if net == "host" || rootless is
+        a = array_push(a, "h mount --rbind /sys \"$ROOT/sys\" && h mount -o remount,bind,ro \"$ROOT/sys\" 2>/dev/null || true")
+    else is
+        a = array_push(a, "h mount -t sysfs -o ro,nosuid,nodev,noexec sysfs \"$ROOT/sys\" 2>/dev/null || true")
+    end
+    a = array_push(a, "h mount -t tmpfs -o nosuid,strictatime,mode=755,size=65536k tmpfs \"$ROOT/dev\"")
+    a = array_push(a, "for n in null zero full random urandom tty; do : > \"$ROOT/dev/$n\"; h mount --bind /dev/$n \"$ROOT/dev/$n\" 2>/dev/null || true; done")
+    a = array_push(a, "h mkdir -p \"$ROOT/dev/pts\" \"$ROOT/dev/shm\"")
+    a = array_push(a, "h mount -t devpts -o newinstance,ptmxmode=0666,mode=0620 devpts \"$ROOT/dev/pts\" 2>/dev/null || true")
+    a = array_push(a, "h mount -t tmpfs -o nosuid,noexec,nodev,mode=1777,size=65536k shm \"$ROOT/dev/shm\"")
+    a = array_push(a, "h ln -sf pts/ptmx \"$ROOT/dev/ptmx\"; h ln -sf /proc/self/fd \"$ROOT/dev/fd\"; h ln -sf /proc/self/fd/0 \"$ROOT/dev/stdin\"; h ln -sf /proc/self/fd/1 \"$ROOT/dev/stdout\"; h ln -sf /proc/self/fd/2 \"$ROOT/dev/stderr\"")
+    if !privileged is
+        let masked: [string] = spec::masked_paths()
+        let mut mk: int = 0
+        while mk < array_len(masked) is
+            a = array_push(a, "if [ -d \"$ROOT" + masked[mk] + "\" ]; then h mount -t tmpfs -o ro tmpfs \"$ROOT" + masked[mk] + "\" 2>/dev/null || true; elif [ -e \"$ROOT" + masked[mk] + "\" ]; then h mount --bind /dev/null \"$ROOT" + masked[mk] + "\" 2>/dev/null || true; fi")
+            mk += 1
+        end
+        let ro: [string] = spec::readonly_paths()
+        let mut rp: int = 0
+        while rp < array_len(ro) is
+            a = array_push(a, "if [ -e \"$ROOT" + ro[rp] + "\" ]; then h mount --bind \"$ROOT" + ro[rp] + "\" \"$ROOT" + ro[rp] + "\" 2>/dev/null && h mount -o remount,bind,ro \"$ROOT" + ro[rp] + "\" 2>/dev/null || true; fi")
+            rp += 1
+        end
+    end
+    a = array_push(a, "h hostname " + util::sq(sp.sp_hostname))
+    if net == "bridge" is
+        a = array_push(a, "i=0; while [ ! -e \"$CD/net-ready\" ] && [ $i -lt 600 ]; do i=$((i+1)); sleep 0.05; done")
+    end
+    a = array_push(a, "h mkdir -p \"$ROOT/.po\"")
+    if sp.sp_readonly is a = array_push(a, "h mount -o remount,bind,ro \"$ROOT\"") end
+    a = array_push(a, "cd \"$ROOT\"")
+    a = array_push(a, "h pivot_root . .po")
+    a = array_push(a, "cd /")
+    a = array_push(a, lazy_umount_cmd())
+    return a
+end
+
+fn write_scripts(s: store::Store, id: string, sp: spec::Spec, chains: [string], mode: string, net: string, privileged: bool) is
+    let d: string = dir_of(s, id)
+    let rootless: bool = !util::is_root()
+    let a: [string] = stage_a(s, id, sp, chains, mode, net, privileged)
+    let sh_bin: string = tool_path("sh")
+    let mut sh: [string] = ["#!/bin/sh", "# generated by the container library - do not edit", "CD=" + util::sq(d), "ROOT=" + util::sq(sp.sp_rootfs), "HP=" + util::sq(host_path()), "h() {{ PATH=$HP \"$@\"; }}", "cd /"]
+    sh = array_concat(sh, ["(", "exec 4> \"$CD/go\"", "(", "set -e"])
+    sh = array_concat(sh, a)
+    sh = array_concat(sh, ["echo ok >&4", ") || echo fail >&4", ") &"])
+    sh = array_push(sh, "exec 3< \"$CD/go\"")
+    let barrier: string = "read r <&3; if [ \"$r\" != ok ]; then echo 'container: could not set up the root filesystem' >&2; exit 126; fi; exec 3<&-; cd \"$1\" 2>/dev/null || cd /; shift; exec \"$@\""
+    sh = array_push(sh, "exec " + setpriv_prefix(sp, privileged) + sh_bin + " -c " + util::sq(barrier) + " container " + util::sq(sp.sp_cwd) + " " + sh_quote_list(sp.sp_args))
+    util::write_file(d + "/init.sh", util::join(sh, "\n") + "\n")
+
+    let mut flags: [string] = ["--mount", "--uts", "--ipc", "--pid", "--fork"]
+    if net != "host" is flags = array_push(flags, "--net") end
+    if rootless || util::has(sp.sp_namespaces, "user") is flags = array_concat(flags, ["--user", "--map-root-user"]) end
+    if string_contains(util::capture("unshare --help 2>&1"), "kill-child") is flags = array_push(flags, "--kill-child") end
+    let env_bin: string = tool_path("env")
+    let mut sup: [string] = ["#!/bin/sh", "CD=" + util::sq(d), "rm -f \"$CD/exit\" \"$CD/pid\" \"$CD/finished\" \"$CD/go\"", "mkfifo \"$CD/go\"", "date -u +%Y-%m-%dT%H:%M:%SZ > \"$CD/started\""]
+    sup = array_push(sup, "if [ -e \"$CD/cgroups\" ]; then while read g; do echo $$ > \"$g/cgroup.procs\" 2>/dev/null; done < \"$CD/cgroups\"; fi")
+    sup = array_push(sup, "unshare " + util::join(flags, " ") + " " + env_bin + " -i " + sh_quote_list(sp.sp_env) + " " + sh_bin + " \"$CD/init.sh\" &")
+    sup = array_push(sup, "U=$!")
+    sup = array_push(sup, "P=")
+    sup = array_push(sup, "i=0")
+    sup = array_push(sup, "while [ $i -lt 80 ]; do")
+    sup = array_push(sup, "  P=$(cut -d' ' -f1 /proc/$U/task/$U/children 2>/dev/null)")
+    sup = array_push(sup, "  if [ -z \"$P\" ]; then P=$(ps -o pid= --ppid $U 2>/dev/null | head -n 1 | tr -d ' '); fi")
+    sup = array_push(sup, "  [ -n \"$P\" ] && break")
+    sup = array_push(sup, "  sleep 0.05; i=$((i+1))")
+    sup = array_push(sup, "done")
+    sup = array_push(sup, "[ -n \"$P\" ] || P=$U")
+    sup = array_push(sup, "echo $P > \"$CD/pid\"")
+    sup = array_push(sup, "wait $U")
+    sup = array_push(sup, "rc=$?")
+    sup = array_push(sup, "echo $rc > \"$CD/exit\"")
+    sup = array_push(sup, "date -u +%Y-%m-%dT%H:%M:%SZ > \"$CD/finished\"")
+    sup = array_push(sup, "exit $rc")
+    util::write_file(d + "/supervise.sh", util::join(sup, "\n") + "\n")
+end
+
+;; ── Start / stop ─────────────────────────────────────────────────────────────
+
+;; Starts a created (or exited) container.
+;; attach=true  : output goes to this terminal, returns the container's exit code.
+;; attach=false : output goes to console.log, returns 0 once the container is running.
+;; Returns -1 when the container could not be started.
+pub fn start(s: store::Store, id: string, attach: bool) -> int is
+    let d: string = dir_of(s, id)
+    let st: string = status(s, id)
+    if st == "unknown" is
+        util::eprint("start: no such container")
+        return 0 - 1
+    end
+    if st == "running" is
+        util::eprint("start: container is already running")
+        return 0 - 1
+    end
+    util::quiet("rm -f " + util::sq(d + "/exit") + " " + util::sq(d + "/pid") + " " + util::sq(d + "/released") + " " + util::sq(d + "/cgroups") + " " + util::sq(d + "/net-ready"))
+    let net: string = state_get(s, id, "network")
+    let publish: [string] = util::csv(state_get(s, id, "publish"))
+    let mut ip: string = ""
+    if net == "bridge" is
+        ip = network::alloc_ip(s, id)
+        if ip == "" is
+            util::eprint("start: no free address in " + network::subnet())
+            return 0 - 1
+        end
+        state_set(s, id, "ip", ip)
+        util::write_file(d + "/etc/hosts", network::hosts_file(ip, util::read_trim(d + "/etc/hostname")))
+    end
+    let cfg: string = util::read(d + "/config.json")
+    let res: string = jx::field(jx::field(cfg, "linux"), "resources")
+    let mem: int = jx::field_int(jx::field(res, "memory"), "limit", 0)
+    let quota: int = jx::field_int(jx::field(res, "cpu"), "quota", 0)
+    let period: int = jx::field_int(jx::field(res, "cpu"), "period", 100000)
+    let pids: int = jx::field_int(jx::field(res, "pids"), "limit", 0)
+    let shares: int = util::atoi(state_get(s, id, "shares"))
+    if mem > 0 || quota > 0 || pids > 0 || shares > 0 is
+        if cgroup::create(id, mem, quota, period, pids, shares) is
+            util::write_file(d + "/cgroups", util::join(cgroup::dirs(id), "\n") + "\n")
+        else is
+            util::eprint("warning: cannot create a cgroup - resource limits are not enforced")
+        end
+    end
+    let launch: string = if attach then "sh " + util::sq(d + "/supervise.sh") + " <&0 &" else "setsid sh " + util::sq(d + "/supervise.sh") + " </dev/null >> " + util::sq(d + "/console.log") + " 2>&1 &"
+    util::run(launch)
+    if !wait_for_file(d + "/pid", 100) is
+        util::eprint("start: the container did not come up (see " + d + "/console.log)")
+        release(s, id)
+        return 0 - 1
+    end
+    let pid: int = pid_of(s, id)
+    if net == "bridge" is
+        if !network::setup(id, pid, ip, publish) is
+            util::eprint("warning: network setup failed; the container has no connectivity")
+        end
+        util::quiet("touch " + util::sq(d + "/net-ready"))
+    end
+    if !attach is return 0 end
+    while status(s, id) == "running" is
+        util::quiet("sleep 0.1")
+    end
+    return exit_code(s, id)
+end
+
+;; Sends a signal ("TERM", "KILL", "HUP", ...) to the container's init process.
+pub fn kill(s: store::Store, id: string, signal: string) -> bool is
+    if status(s, id) != "running" is return false end
+    return util::quiet("kill -" + signal + " " + to_string(pid_of(s, id))) == 0
+end
+
+;; Waits for the container to exit; returns its exit code, or -1 on timeout (0 = forever).
+pub fn wait(s: store::Store, id: string, timeout_ms: int) -> int is
+    let started: int = util::now_ms()
+    while status(s, id) == "running" is
+        if timeout_ms > 0 && util::now_ms() - started > timeout_ms is return 0 - 1 end
+        util::quiet("sleep 0.1")
+    end
+    return exit_code(s, id)
+end
+
+;; SIGTERM, then SIGKILL after `timeout_s` seconds.
+pub fn stop(s: store::Store, id: string, timeout_s: int) -> bool is
+    if status(s, id) != "running" is return true end
+    kill(s, id, "TERM")
+    if wait(s, id, timeout_s * 1000) >= 0 && status(s, id) != "running" is return true end
+    kill(s, id, "KILL")
+    wait(s, id, 5000)
+    return status(s, id) != "running"
+end
+
+;; Runs a command inside a running container (namespaces, cgroup, environment and user
+;; of the container). Returns the command's exit code.
+pub fn exec(s: store::Store, id: string, args: [string], extra_env: [string], user: string, workdir: string) -> int is
+    if status(s, id) != "running" is
+        util::eprint("exec: container is not running")
+        return 0 - 1
+    end
+    let d: string = dir_of(s, id)
+    let pid: int = pid_of(s, id)
+    let cfg: string = util::read(d + "/config.json")
+    let proc: string = jx::field(cfg, "process")
+    let env: [string] = merge_env(jx::str_items(jx::field(proc, "env")), extra_env)
+    let cwd: string = util::or_default(workdir, jx::field_str(proc, "cwd"))
+    let ns: string = "-m -u -i -p" + (if state_get(s, id, "network") == "host" then "" else " -n")
+    let who: string = util::or_default(user, jx::field_str(jx::field(proc, "user"), "uid") + ":" + jx::field_str(jx::field(proc, "user"), "gid"))
+    let mut uidgid: string = ""
+    let uid_txt: string = util::head_before(who, ":")
+    let gid_txt: string = if string_contains(who, ":") then util::tail_after(who, ":") else "0"
+    if util::is_number(uid_txt) is
+        uidgid = " -S " + uid_txt + " -G " + util::or_default(gid_txt, "0")
+    end
+    let mut cg: string = ""
+    if util::exists(d + "/cgroups") is
+        cg = "while read g; do echo $$ > \"$g/cgroup.procs\" 2>/dev/null; done < " + util::sq(d + "/cgroups") + "; "
+    end
+    let has_setpriv: bool = util::exists("/proc/" + to_string(pid) + "/root/usr/bin/setpriv") || util::exists("/proc/" + to_string(pid) + "/root/bin/setpriv")
+    let mut inner: string = sh_quote_list(args)
+    if has_setpriv && state_get(s, id, "privileged") != "1" is
+        let caps: [string] = jx::str_items(jx::field(jx::field(proc, "capabilities"), "bounding"))
+        let mut keep: [string] = ["-all"]
+        let mut i: int = 0
+        while i < array_len(caps) is
+            keep = array_push(keep, "+" + spec::cap_short(caps[i]))
+            i += 1
+        end
+        inner = "setpriv --no-new-privs --bounding-set " + util::join(keep, ",") + " --inh-caps -all -- " + inner
+    else is
+        if state_get(s, id, "privileged") != "1" is util::eprint("warning: no setpriv in the image - the command keeps the host's capabilities") end
+    end
+    let cmd: string = cg + "exec env -i " + sh_quote_list(env) + " nsenter -t " + to_string(pid) + " " + ns + uidgid + " --wd=" + util::sq(cwd) + " -- " + inner
+    return util::run("sh -c " + util::sq(cmd))
+end
+
+;; Removes a container and its files. A running container needs `force`.
+pub fn remove(s: store::Store, id: string, force: bool) -> bool is
+    let st: string = status(s, id)
+    if st == "unknown" is return false end
+    if st == "running" is
+        if !force is
+            util::eprint("remove: container is running (stop it first or use force)")
+            return false
+        end
+        stop(s, id, 2)
+    end
+    release(s, id)
+    return util::rm_rf(dir_of(s, id))
+end
+
+;; create + start (attached) + remove when `rm` is set. Returns the exit code, or -1.
+pub fn run_container(s: store::Store, o: Options) -> int is
+    let id: string = create(s, o)
+    if id == "" is return 0 - 1 end
+    let detach: bool = opt_flag(o, "detach")
+    let code: int = start(s, id, !detach)
+    if !detach && opt_flag(o, "rm") is remove(s, id, true) end
+    return code
+end
