@@ -1,1 +1,23 @@
+[package]
+-> name        => container
+-> version     => 0.1.0
+-> description => Containers for bit.io: OCI images, local store, registry client, Containerfile builder and a native runtime
+-> authors     => ["Bit Developers"]
+-> license     => Apache-2.0
+-> repository  => https://github.com/bit-io/container
+-> keywords    => ["container", "oci", "image", "registry", "runtime", "namespaces", "cgroups"]
+-> lang        => h#
 
+[edition]
+-> edition => 2026
+
+[build]
+-> link => static
+
+[lib]
+-> output => hlib
+
+[default-build]
+-> profile => release
+
+[dependencies]
