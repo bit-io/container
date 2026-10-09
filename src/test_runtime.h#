@@ -1,0 +1,436 @@
+mod util
+mod jx
+mod digest
+mod reference
+mod store
+mod image
+mod spec
+mod cgroup
+mod network
+mod runtime
+
+fn check(cond: bool, msg: string) is
+    assert(cond, msg)
+end
+
+fn same(a: string, b: string, what: string) is
+    assert(a == b, what + ": expected [" + b + "] got [" + a + "]")
+end
+
+fn same_int(a: int, b: int, what: string) is
+    assert(a == b, what + ": expected " + to_string(b) + " got " + to_string(a))
+end
+
+fn can_run() -> bool is
+    return util::is_root() && util::tool_exists("unshare") && util::tool_exists("pivot_root") && util::tool_exists("setpriv") && util::quiet("unshare --mount --uts --pid --fork true") == 0
+end
+
+;; Builds a minimal rootfs (busybox-free: copies a few host tools and their libraries).
+fn make_rootfs(dir: string) is
+    util::mkdir_p(dir + "/proc")
+    util::mkdir_p(dir + "/dev")
+    util::mkdir_p(dir + "/sys")
+    util::mkdir_p(dir + "/tmp")
+    util::mkdir_p(dir + "/etc")
+    util::mkdir_p(dir + "/out")
+    let tools: string = "sh echo cat ls mkdir touch rm env hostname id sleep true false pwd ln readlink cp grep head"
+    util::quiet("for b in " + tools + "; do p=$(which $b 2>/dev/null); [ -n \"$p\" ] || continue; cp --parents -L \"$p\" " + util::sq(dir) + "/; for l in $(ldd \"$p\" 2>/dev/null | grep -o '/[^ ]*'); do cp --parents -L \"$l\" " + util::sq(dir) + "/; done; done")
+    if util::is_dir("/bin") && util::capture("readlink /bin") != "" is util::quiet("ln -s usr/bin " + util::sq(dir + "/bin")) end
+    util::write_file(dir + "/etc/passwd", "root:x:0:0:root:/root:/bin/sh\nnobody:x:65534:65534:nobody:/:/bin/sh\n")
+    util::write_file(dir + "/etc/group", "root:x:0:\nnobody:x:65534:\n")
+end
+
+;; Opens a store in a fresh sandbox and imports the mini image as "mini:1".
+fn setup(dir: string, driver: string) -> store::Store is
+    make_rootfs(dir + "/rootfs")
+    util::quiet("tar -cf " + util::sq(dir + "/rootfs.tar") + " -C " + util::sq(dir + "/rootfs") + " .")
+    let s: store::Store = store::open(dir + "/store", dir + "/run", driver)
+    let mut c: image::ImageConfig = image::new_config()
+    c.ic_cmd = ["/bin/sh", "-c", "echo default command"]
+    c.ic_env = ["IMAGE_VAR=from-image"]
+    image::import_rootfs(s, dir + "/rootfs.tar", "mini:1", c)
+    return s
+end
+
+fn host_opts(arg_list: [string]) -> runtime::Options is
+    let mut o: runtime::Options = runtime::options("mini:1")
+    o = runtime::opt(o, "network", "host")
+    o = runtime::opt(o, "detach", "true")
+    let mut i: int = 0
+    while i < array_len(arg_list) is
+        o = runtime::opt_add(o, "arg", arg_list[i])
+        i += 1
+    end
+    return o
+end
+
+;; ── Pure helpers ─────────────────────────────────────────────────────────────
+
+#[test]
+fn runtime_options_behave_like_a_multimap() is
+    let mut o: runtime::Options = runtime::options("alpine")
+    o = runtime::opt(o, "name", "web")
+    o = runtime::opt(o, "name", "web2")
+    o = runtime::opt_add(o, "env", "A=1")
+    o = runtime::opt_add(o, "env", "B=2")
+    same(runtime::opt_get(o, "image"), "alpine", "image")
+    same(runtime::opt_get(o, "name"), "web2", "last set wins")
+    same_int(array_len(runtime::opt_all(o, "env")), 2, "repeated key")
+    check(runtime::opt_has(o, "env"), "has env")
+    check(!runtime::opt_has(o, "memory"), "no memory")
+    o = runtime::opt(o, "rm", "true")
+    check(runtime::opt_flag(o, "rm"), "flag")
+    check(!runtime::opt_flag(o, "detach"), "unset flag")
+    same(runtime::opt_get(o, "env"), "B=2", "get returns the last value")
+end
+
+#[test]
+fn runtime_merges_environment_and_parses_cpus() is
+    let m: [string] = runtime::merge_env(["A=1", "B=2", "C=3"], ["B=9", "D=4"])
+    same(util::join(m, ","), "A=1,C=3,B=9,D=4", "merge")
+    same_int(runtime::cpus_to_quota("2"), 200000, "2 cpus")
+    same_int(runtime::cpus_to_quota("0.5"), 50000, "half a cpu")
+    same_int(runtime::cpus_to_quota("1.25"), 125000, "1.25 cpus")
+    same_int(runtime::cpus_to_quota(""), 0, "unset")
+end
+
+#[test]
+fn spec_resolves_users_and_adjusts_capabilities() is
+    let dir: string = util::capture("mktemp -d")
+    util::write_file(dir + "/etc/passwd", "root:x:0:0::/root:/bin/sh\napp:x:1000:1001::/home/app:/bin/sh\n")
+    util::write_file(dir + "/etc/group", "root:x:0:\nstaff:x:50:\n")
+    same(spec::resolve_user(dir, "app"), "1000:1001", "name -> uid:gid")
+    same(spec::resolve_user(dir, "app:staff"), "1000:50", "name:group")
+    same(spec::resolve_user(dir, "1000"), "1000:1001", "numeric uid finds its gid")
+    same(spec::resolve_user(dir, "42:7"), "42:7", "numeric pair unchanged")
+    same(spec::resolve_user(dir, "ghost"), "ghost", "unknown stays")
+    same(spec::resolve_user(dir, ""), "0:0", "default root")
+    let caps: [string] = spec::adjust_caps(spec::default_caps(), ["net_admin"], ["CAP_MKNOD", "chown"])
+    check(util::has(caps, "CAP_NET_ADMIN"), "added")
+    check(!util::has(caps, "CAP_MKNOD") && !util::has(caps, "CAP_CHOWN"), "dropped")
+    same_int(array_len(spec::adjust_caps(spec::default_caps(), [], ["all"])), 0, "drop all")
+    same(spec::cap_short("CAP_NET_RAW"), "net_raw", "short")
+    util::rm_rf(dir)
+end
+
+#[test]
+fn spec_produces_a_valid_oci_config() is
+    let mut sp: spec::Spec = spec::new_spec("/rootfs")
+    sp.sp_args = ["/bin/app", "--flag"]
+    sp.sp_env = ["A=1"]
+    sp.sp_hostname = "box"
+    sp.sp_mem = 268435456
+    sp.sp_cpu_quota = 50000
+    sp.sp_pids = 64
+    sp.sp_mounts = ["/srv/data:/data:ro", "/tmp/x:/x"]
+    sp.sp_namespaces = ["pid", "network", "mount"]
+    let j: string = spec::to_json(sp)
+    check(jx::looks_valid(j), "valid json")
+    same(jx::field_str(j, "ociVersion"), "1.0.2", "version")
+    same(jx::field_str(j, "hostname"), "box", "hostname")
+    same(util::join(jx::str_items(jx::field(jx::field(j, "process"), "args")), " "), "/bin/app --flag", "args")
+    same(jx::field_str(jx::field(j, "root"), "path"), "/rootfs", "root")
+    let res: string = jx::field(jx::field(j, "linux"), "resources")
+    same_int(jx::field_int(jx::field(res, "memory"), "limit", 0), 268435456, "memory")
+    same_int(jx::field_int(jx::field(res, "pids"), "limit", 0), 64, "pids")
+    same_int(array_len(jx::items(jx::field(j, "mounts"))), 7, "5 defaults + 2 binds")
+    same_int(array_len(jx::items(jx::field(jx::field(j, "linux"), "namespaces"))), 3, "namespaces")
+    if util::tool_exists("python3") is
+        util::write_file("/tmp/_spec_check.json", j)
+        check(util::quiet("python3 -m json.tool /tmp/_spec_check.json") == 0, "python accepts the document")
+        util::quiet("rm -f /tmp/_spec_check.json")
+    end
+end
+
+#[test]
+fn network_plans_and_parses_ports() is
+    let pm: network::PortMap = network::parse_publish("127.0.0.1:8080:80/udp")
+    check(pm.pm_ok, "ok")
+    same(pm.pm_host_ip, "127.0.0.1", "ip")
+    same_int(pm.pm_host_port, 8080, "host port")
+    same_int(pm.pm_ctr_port, 80, "container port")
+    same(pm.pm_proto, "udp", "proto")
+    check(!network::parse_publish("80").pm_ok, "needs host:container")
+    check(!network::parse_publish("a:b").pm_ok, "numbers only")
+    let id: string = string_repeat("ab", 32)
+    let plan: [string] = network::plan_setup(id, 4242, "10.88.0.7", ["8080:80"])
+    check(string_contains(util::join(plan, "\n"), "ip link set vcabababab netns 4242"), "moves the peer")
+    check(string_contains(util::join(plan, "\n"), "--to-destination 10.88.0.7:80"), "dnat")
+    check(string_contains(util::join(plan, "\n"), "MASQUERADE"), "nat")
+    let down: [string] = network::plan_teardown(id, "10.88.0.7", ["8080:80"])
+    check(string_contains(util::join(down, "\n"), "-D PREROUTING"), "removes dnat")
+    check(string_contains(util::join(down, "\n"), "ip link del vhabababab"), "removes veth")
+    check(string_contains(network::hosts_file("10.88.0.7", "box"), "10.88.0.7\tbox"), "hosts")
+    check(string_contains(network::resolv_conf(), "nameserver"), "resolv.conf has a nameserver")
+end
+
+#[test]
+fn network_allocates_distinct_addresses() is
+    let dir: string = util::capture("mktemp -d")
+    let s: store::Store = store::open(dir + "/store", dir + "/run", "vfs")
+    let a: string = network::alloc_ip(s, "one")
+    let b: string = network::alloc_ip(s, "two")
+    same(a, "10.88.0.2", "first")
+    same(b, "10.88.0.3", "second")
+    network::release_ip(s, a)
+    same(network::alloc_ip(s, "three"), "10.88.0.2", "reuses a released address")
+    util::rm_rf(dir)
+end
+
+;; ── Real containers ──────────────────────────────────────────────────────────
+
+#[test]
+fn runtime_create_writes_a_bundle() is
+    let dir: string = util::capture("mktemp -d")
+    let s: store::Store = setup(dir, "vfs")
+    let mut o: runtime::Options = runtime::options("mini:1")
+    o = runtime::opt(o, "network", "none")
+    o = runtime::opt(o, "name", "bundle1")
+    o = runtime::opt(o, "hostname", "boxy")
+    o = runtime::opt(o, "workdir", "/tmp")
+    o = runtime::opt_add(o, "env", "EXTRA=yes")
+    o = runtime::opt(o, "memory", "64m")
+    let id: string = runtime::create(s, o)
+    check(string_len(id) == 64, "id")
+    same(runtime::find(s, "bundle1"), id, "by name")
+    same(runtime::find(s, string_slice(id, 0, 10)), id, "by id prefix")
+    same(runtime::status(s, id), "created", "status")
+    let d: string = runtime::dir_of(s, id)
+    let cfg: string = util::read(d + "/config.json")
+    check(jx::looks_valid(cfg), "config.json")
+    same(jx::field_str(cfg, "hostname"), "boxy", "hostname")
+    let env: [string] = jx::str_items(jx::field(jx::field(cfg, "process"), "env"))
+    check(util::has(env, "IMAGE_VAR=from-image") && util::has(env, "EXTRA=yes"), "env merged")
+    same(jx::field_str(jx::field(cfg, "process"), "cwd"), "/tmp", "cwd")
+    check(util::is_file(d + "/init.sh") && util::is_file(d + "/supervise.sh"), "scripts")
+    check(util::is_file(d + "/rootfs/etc/passwd"), "rootfs copied")
+    check(runtime::create(s, o) == "", "duplicate name refused")
+    check(runtime::create(s, runtime::options("missing:1")) == "", "unknown image refused")
+    check(runtime::remove(s, id, false), "remove")
+    check(!util::exists(d), "directory gone")
+    util::rm_rf(dir)
+end
+
+#[test]
+fn runtime_runs_a_command_in_fresh_namespaces() is
+    if !can_run() is return end
+    let dir: string = util::capture("mktemp -d")
+    let s: store::Store = setup(dir, "vfs")
+    util::mkdir_p(dir + "/out")
+    let mut o: runtime::Options = host_opts(["/bin/sh", "-c", "echo hello from $(hostname); echo $$ > /out/pid; ls / > /out/rootls; id -u > /out/uid"])
+    o = runtime::opt(o, "hostname", "boxed")
+    o = runtime::opt_add(o, "volume", dir + "/out:/out")
+    let id: string = runtime::create(s, o)
+    check(id != "", "created")
+    same_int(runtime::start(s, id, false), 0, "started")
+    same_int(runtime::wait(s, id, 20000), 0, "exit code")
+    same(runtime::status(s, id), "exited", "status")
+    check(string_contains(runtime::logs(s, id), "hello from boxed"), "own hostname: " + runtime::logs(s, id))
+    same(util::read_trim(dir + "/out/pid"), "1", "pid 1 in its own pid namespace")
+    same(util::read_trim(dir + "/out/uid"), "0", "root inside")
+    let rootls: string = util::read(dir + "/out/rootls")
+    check(!string_contains(rootls, "home") && !string_contains(rootls, "var"), "sees only its own root: " + rootls)
+    check(util::capture("hostname") != "boxed", "host hostname untouched")
+    check(runtime::remove(s, id, false), "removed")
+    util::rm_rf(dir)
+end
+
+#[test]
+fn runtime_reports_exit_codes_and_uses_image_defaults() is
+    if !can_run() is return end
+    let dir: string = util::capture("mktemp -d")
+    let s: store::Store = setup(dir, "vfs")
+    let id: string = runtime::create(s, host_opts(["/bin/sh", "-c", "echo to-log; exit 7"]))
+    runtime::start(s, id, false)
+    same_int(runtime::wait(s, id, 20000), 7, "exit code")
+    check(string_contains(runtime::logs(s, id), "to-log"), "logs")
+    let d: string = runtime::dir_of(s, id)
+    let mut o: runtime::Options = runtime::options("mini:1")
+    o = runtime::opt(o, "network", "host")
+    o = runtime::opt(o, "detach", "true")
+    let id2: string = runtime::create(s, o)
+    runtime::start(s, id2, false)
+    same_int(runtime::wait(s, id2, 20000), 0, "image CMD ran")
+    check(string_contains(runtime::logs(s, id2), "default command"), "image CMD output")
+    same_int(runtime::start(s, id, false), 0, "restart")
+    same_int(runtime::wait(s, id, 20000), 7, "same code after restart")
+    check(d != "", "dir")
+    util::rm_rf(dir)
+end
+
+#[test]
+fn runtime_applies_environment_workdir_user_and_caps() is
+    if !can_run() is return end
+    let dir: string = util::capture("mktemp -d")
+    let s: store::Store = setup(dir, "vfs")
+    util::mkdir_p(dir + "/out")
+    util::quiet("chmod 777 " + util::sq(dir + "/out"))
+    let mut o: runtime::Options = host_opts(["/bin/sh", "-c", "pwd > /out/pwd; id -u > /out/uid; id -g > /out/gid; echo $IMAGE_VAR-$MY_VAR > /out/env; grep CapEff /proc/self/status > /out/caps; grep NoNewPrivs /proc/self/status > /out/nnp"])
+    o = runtime::opt(o, "workdir", "/tmp")
+    o = runtime::opt(o, "user", "nobody")
+    o = runtime::opt_add(o, "env", "MY_VAR=custom")
+    o = runtime::opt_add(o, "volume", dir + "/out:/out")
+    let id: string = runtime::create(s, o)
+    runtime::start(s, id, false)
+    same_int(runtime::wait(s, id, 20000), 0, "ran: " + runtime::logs(s, id))
+    same(util::read_trim(dir + "/out/pwd"), "/tmp", "workdir")
+    same(util::read_trim(dir + "/out/uid"), "65534", "user resolved through /etc/passwd")
+    same(util::read_trim(dir + "/out/gid"), "65534", "group")
+    same(util::read_trim(dir + "/out/env"), "from-image-custom", "environment")
+    check(string_contains(util::read(dir + "/out/caps"), "0000000000000000"), "non-root has no effective capabilities")
+    check(string_contains(util::read(dir + "/out/nnp"), "1"), "no_new_privs")
+    util::rm_rf(dir)
+end
+
+#[test]
+fn runtime_drops_capabilities_for_root() is
+    if !can_run() is return end
+    let dir: string = util::capture("mktemp -d")
+    let s: store::Store = setup(dir, "vfs")
+    util::mkdir_p(dir + "/out")
+    let mut o: runtime::Options = host_opts(["/bin/sh", "-c", "grep CapBnd /proc/self/status > /out/bnd"])
+    o = runtime::opt_add(o, "volume", dir + "/out:/out")
+    let id: string = runtime::create(s, o)
+    runtime::start(s, id, false)
+    runtime::wait(s, id, 20000)
+    let bnd: string = util::read_trim(dir + "/out/bnd")
+    check(string_contains(bnd, "CapBnd"), "read: " + bnd)
+    check(!string_contains(bnd, "ffffffff") && !string_contains(bnd, "000001ffffffffff"), "not the full bounding set: " + bnd)
+    let mut p: runtime::Options = host_opts(["/bin/sh", "-c", "grep CapBnd /proc/self/status > /out/bnd2"])
+    p = runtime::opt(p, "privileged", "true")
+    p = runtime::opt_add(p, "volume", dir + "/out:/out")
+    let pid2: string = runtime::create(s, p)
+    runtime::start(s, pid2, false)
+    runtime::wait(s, pid2, 20000)
+    check(string_contains(util::read_trim(dir + "/out/bnd2"), "ffff"), "privileged keeps everything")
+    util::rm_rf(dir)
+end
+
+#[test]
+fn runtime_mounts_volumes_and_honours_readonly() is
+    if !can_run() is return end
+    let dir: string = util::capture("mktemp -d")
+    let s: store::Store = setup(dir, "vfs")
+    util::write_file(dir + "/data/in.txt", "from host\n")
+    util::mkdir_p(dir + "/out")
+    let mut o: runtime::Options = host_opts(["/bin/sh", "-c", "cat /data/in.txt > /out/read; echo x > /data/w 2> /out/rowrite; echo rc=$? >> /out/rowrite; echo y > /out/ok"])
+    o = runtime::opt_add(o, "volume", dir + "/data:/data:ro")
+    o = runtime::opt_add(o, "volume", dir + "/out:/out")
+    let id: string = runtime::create(s, o)
+    runtime::start(s, id, false)
+    runtime::wait(s, id, 20000)
+    same(util::read_trim(dir + "/out/read"), "from host", "reads the volume")
+    check(!string_contains(util::read(dir + "/out/rowrite"), "rc=0"), "read-only volume rejects writes: " + util::read(dir + "/out/rowrite"))
+    check(!util::exists(dir + "/data/w"), "nothing written")
+    same(util::read_trim(dir + "/out/ok"), "y", "read-write volume works")
+    let mut r: runtime::Options = host_opts(["/bin/sh", "-c", "touch /newfile; echo rc=$? > /out/ro"])
+    r = runtime::opt(r, "readonly", "true")
+    r = runtime::opt_add(r, "volume", dir + "/out:/out")
+    let id2: string = runtime::create(s, r)
+    runtime::start(s, id2, false)
+    runtime::wait(s, id2, 20000)
+    check(!string_contains(util::read(dir + "/out/ro"), "rc=0"), "read-only rootfs: " + util::read(dir + "/out/ro"))
+    util::rm_rf(dir)
+end
+
+#[test]
+fn runtime_stop_terminates_long_running_containers() is
+    if !can_run() is return end
+    let dir: string = util::capture("mktemp -d")
+    let s: store::Store = setup(dir, "vfs")
+    let id: string = runtime::create(s, host_opts(["/bin/sleep", "300"]))
+    same_int(runtime::start(s, id, false), 0, "started")
+    same(runtime::status(s, id), "running", "running")
+    check(runtime::pid_of(s, id) > 1, "has a host pid")
+    check(!runtime::remove(s, id, false), "cannot remove while running")
+    check(runtime::stop(s, id, 1), "stop")
+    same(runtime::status(s, id), "exited", "exited")
+    check(runtime::exit_code(s, id) != 0, "killed, not a clean exit")
+    check(runtime::remove(s, id, false), "remove after stop")
+    util::rm_rf(dir)
+end
+
+#[test]
+fn runtime_exec_joins_a_running_container() is
+    if !can_run() is return end
+    let dir: string = util::capture("mktemp -d")
+    let s: store::Store = setup(dir, "vfs")
+    util::mkdir_p(dir + "/out")
+    let mut o: runtime::Options = host_opts(["/bin/sleep", "300"])
+    o = runtime::opt(o, "hostname", "execbox")
+    o = runtime::opt_add(o, "volume", dir + "/out:/out")
+    let id: string = runtime::create(s, o)
+    runtime::start(s, id, false)
+    let rc: int = runtime::exec(s, id, ["/bin/sh", "-c", "hostname > /out/h; echo $IMAGE_VAR > /out/v; ls /proc | head -c 0; echo $$ > /out/p"], [], "", "")
+    same_int(rc, 0, "exec exit code")
+    same(util::read_trim(dir + "/out/h"), "execbox", "same uts namespace")
+    same(util::read_trim(dir + "/out/v"), "from-image", "container environment")
+    check(util::read_trim(dir + "/out/p") != "", "ran")
+    same_int(runtime::exec(s, id, ["/bin/sh", "-c", "exit 5"], [], "", ""), 5, "exec propagates the exit code")
+    runtime::stop(s, id, 1)
+    same_int(runtime::exec(s, id, ["/bin/true"], [], "", ""), 0 - 1, "exec refuses a stopped container")
+    util::rm_rf(dir)
+end
+
+#[test]
+fn runtime_cgroup_limits_are_applied() is
+    if !can_run() || !cgroup::available() is return end
+    let dir: string = util::capture("mktemp -d")
+    let s: store::Store = setup(dir, "vfs")
+    let mut o: runtime::Options = host_opts(["/bin/sleep", "300"])
+    o = runtime::opt(o, "pids", "33")
+    o = runtime::opt(o, "memory", "128m")
+    let id: string = runtime::create(s, o)
+    runtime::start(s, id, false)
+    check(cgroup::exists(id), "group exists")
+    let ds: [string] = cgroup::dirs(id)
+    let mut found_pids: bool = false
+    let mut i: int = 0
+    while i < array_len(ds) is
+        if util::read_trim(ds[i] + "/pids.max") == "33" is found_pids = true end
+        i += 1
+    end
+    check(found_pids, "pids.max is 33")
+    check(array_len(cgroup::procs(id)) > 0, "container processes are in the group")
+    runtime::stop(s, id, 1)
+    check(runtime::remove(s, id, false), "remove")
+    check(!cgroup::exists(id), "group removed with the container")
+    util::rm_rf(dir)
+end
+
+#[test]
+fn runtime_overlay_driver_keeps_layers_pristine() is
+    if !can_run() || !store::overlay_usable() is return end
+    let dir: string = util::capture("mktemp -d")
+    let s: store::Store = setup(dir, "overlay")
+    same(s.st_driver, "overlay", "driver")
+    util::mkdir_p(dir + "/out")
+    let mut o: runtime::Options = host_opts(["/bin/sh", "-c", "echo changed > /etc/new-file; rm /etc/group; ls /etc > /out/etc"])
+    o = runtime::opt_add(o, "volume", dir + "/out:/out")
+    let id: string = runtime::create(s, o)
+    runtime::start(s, id, false)
+    same_int(runtime::wait(s, id, 20000), 0, "ran: " + runtime::logs(s, id))
+    let etc: string = util::read(dir + "/out/etc")
+    check(string_contains(etc, "new-file") && !string_contains(etc, "group"), "changes visible inside: " + etc)
+    let chain: string = image::layer_chains(s, image::resolve(s, "mini:1"))[0]
+    check(util::is_file(store::layers_dir(s) + "/" + chain + "/diff/etc/group"), "image layer still has /etc/group")
+    check(!util::exists(store::layers_dir(s) + "/" + chain + "/diff/etc/new-file"), "image layer untouched")
+    check(util::is_file(runtime::dir_of(s, id) + "/upper/etc/new-file"), "change landed in the upper dir")
+    util::rm_rf(dir)
+end
+
+#[test]
+fn runtime_run_container_returns_exit_code_and_cleans_up() is
+    if !can_run() is return end
+    let dir: string = util::capture("mktemp -d")
+    let s: store::Store = setup(dir, "vfs")
+    let mut o: runtime::Options = runtime::options("mini:1")
+    o = runtime::opt(o, "network", "host")
+    o = runtime::opt(o, "rm", "true")
+    o = runtime::opt_add(o, "arg", "/bin/sh")
+    o = runtime::opt_add(o, "arg", "-c")
+    o = runtime::opt_add(o, "arg", "exit 4")
+    same_int(runtime::run_container(s, o), 4, "exit code")
+    same_int(array_len(runtime::ids(s)), 0, "container removed (--rm)")
+    util::rm_rf(dir)
+end
