@@ -1,0 +1,388 @@
+mod util
+mod jx
+mod digest
+mod reference
+mod store
+mod image
+
+pub struct Session is
+    pub se_base:  string    ;; scheme://host
+    pub se_repo:  string    ;; repository path
+    pub se_hdr:   string    ;; header file with the Authorization header ("" when anonymous)
+    pub se_dir:   string    ;; scratch directory
+    pub se_ok:    bool
+    pub se_error: string
+end
+
+pub struct Resp is
+    pub rs_status:  int
+    pub rs_headers: string
+end
+
+fn accept_manifests() -> string is
+    return "application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json"
+end
+
+;; ── Credentials ──────────────────────────────────────────────────────────────
+
+fn b64_encode(s: string) -> string is
+    return util::capture("printf '%s' " + util::sq(s) + " | base64 | tr -d '\\n'")
+end
+
+fn b64_decode(s: string) -> string is
+    return util::capture("printf '%s' " + util::sq(s) + " | base64 -d 2>/dev/null")
+end
+
+fn docker_config_path() -> string is
+    let dc: string = util::p_env("DOCKER_CONFIG")
+    if dc != "" is return dc + "/config.json" end
+    return util::or_default(util::p_env("HOME"), "/root") + "/.docker/config.json"
+end
+
+;; "user:password" for a registry, or "".
+;; Order: CONTAINER_REGISTRY_USER/PASSWORD, <store>/auth.json, ~/.docker/config.json.
+pub fn credentials(s: store::Store, domain: string) -> string is
+    let u: string = util::p_env("CONTAINER_REGISTRY_USER")
+    if u != "" is return u + ":" + util::p_env("CONTAINER_REGISTRY_PASSWORD") end
+    let own: string = jx::field_str(util::read(s.st_root + "/auth.json"), domain)
+    if own != "" is return b64_decode(own) end
+    let auths: string = jx::field(util::read(docker_config_path()), "auths")
+    let mut keys: [string] = [domain, "https://" + domain]
+    if domain == "docker.io" is keys = array_concat(keys, ["https://index.docker.io/v1/", "index.docker.io"]) end
+    let mut i: int = 0
+    while i < array_len(keys) is
+        let enc: string = jx::field_str(jx::field(auths, keys[i]), "auth")
+        if enc != "" is return b64_decode(enc) end
+        i += 1
+    end
+    return ""
+end
+
+;; Remembers credentials in <store>/auth.json (mode 0600).
+pub fn login(s: store::Store, domain: string, user: string, password: string) -> bool is
+    let path: string = s.st_root + "/auth.json"
+    let old: string = util::read(path)
+    let mut parts: [string] = []
+    let ks: [string] = jx::keys(old)
+    let mut i: int = 0
+    while i < array_len(ks) is
+        if ks[i] != domain is parts = array_push(parts, jx::kv(ks[i], jx::q(jx::field_str(old, ks[i])))) end
+        i += 1
+    end
+    parts = array_push(parts, jx::kv(domain, jx::q(b64_encode(user + ":" + password))))
+    util::quiet("umask 077; : > " + util::sq(path))
+    util::write_file(path, jx::obj(parts) + "\n")
+    util::quiet("chmod 600 " + util::sq(path))
+    return true
+end
+
+pub fn logout(s: store::Store, domain: string) -> bool is
+    let path: string = s.st_root + "/auth.json"
+    let old: string = util::read(path)
+    let mut parts: [string] = []
+    let ks: [string] = jx::keys(old)
+    let mut i: int = 0
+    while i < array_len(ks) is
+        if ks[i] != domain is parts = array_push(parts, jx::kv(ks[i], jx::q(jx::field_str(old, ks[i])))) end
+        i += 1
+    end
+    util::write_file(path, jx::obj(parts) + "\n")
+    util::quiet("chmod 600 " + util::sq(path))
+    return true
+end
+
+;; ── HTTP ─────────────────────────────────────────────────────────────────────
+
+fn secret_file(dir: string, name: string, content: string) -> string is
+    let p: string = dir + "/" + name
+    util::quiet("umask 077; : > " + util::sq(p))
+    util::write_file(p, content)
+    util::quiet("chmod 600 " + util::sq(p))
+    return p
+end
+
+fn header_value(headers: string, name: string) -> string is
+    let want: string = string_lower(name) + ":"
+    let ls: [string] = string_split(headers, "\n")
+    let mut found: string = ""
+    let mut i: int = 0
+    while i < array_len(ls) is
+        let l: string = string_trim(ls[i])
+        if string_starts_with(string_lower(l), want) is
+            found = string_trim(string_slice(l, string_len(want), string_len(l)))
+        end
+        i += 1
+    end
+    return found
+end
+
+;; key="value" parameter of a WWW-Authenticate challenge.
+fn challenge_param(ch: string, key: string) -> string is
+    let pat: string = key + "=\""
+    let i: int = string_find(ch, pat)
+    if i < 0 is return "" end
+    let rest: string = string_slice(ch, i + string_len(pat), string_len(ch))
+    let j: int = string_find(rest, "\"")
+    if j < 0 is return rest end
+    return string_slice(rest, 0, j)
+end
+
+fn url_encode(s: string) -> string is
+    let a: string = string_replace(s, "%", "%25")
+    let b: string = string_replace(a, ":", "%3A")
+    let c: string = string_replace(b, " ", "%20")
+    return string_replace(c, "/", "%2F")
+end
+
+;; One request. `extra` are additional curl arguments; the response body goes to `out`
+;; (or is discarded when "").
+pub fn http(se: Session, method: string, url: string, accept: string, out: string, extra: string) -> Resp is
+    let hdrs: string = se.se_dir + "/resp.hdr"
+    let mut cmd: string = "curl -sS -L --connect-timeout 20 -X " + method + " -D " + util::sq(hdrs)
+    cmd = cmd + " -o " + (if out == "" then "/dev/null" else util::sq(out))
+    if accept != "" is cmd = cmd + " -H " + util::sq("Accept: " + accept) end
+    if se.se_hdr != "" is cmd = cmd + " -H @" + util::sq(se.se_hdr) end
+    cmd = cmd + " " + extra + " -w '%{{http_code}}' " + util::sq(url)
+    let code: string = util::capture(cmd + " 2>/dev/null")
+    return Resp { rs_status: util::atoi(code), rs_headers: util::read(hdrs) }
+end
+
+fn fail(why: string) -> Session is
+    return Session { se_base: "", se_repo: "", se_hdr: "", se_dir: "", se_ok: false, se_error: why }
+end
+
+pub fn close_session(se: Session) is
+    if se.se_dir != "" is util::rm_rf(se.se_dir) end
+end
+
+;; Probes /v2/, answers a Bearer / Basic challenge and returns a ready Session.
+pub fn open_session(s: store::Store, domain: string, repo: string, push: bool) -> Session is
+    let host: string = if domain == "docker.io" then "registry-1.docker.io" else domain
+    let base: string = reference::scheme_for(domain) + "://" + host
+    let dir: string = store::scratch(s, "reg")
+    let anon: Session = Session { se_base: base, se_repo: repo, se_hdr: "", se_dir: dir, se_ok: true, se_error: "" }
+    let probe: Resp = http(anon, "GET", base + "/v2/", "", "", "")
+    if probe.rs_status == 200 is
+        if push && credentials(s, domain) != "" is
+            let creds: string = credentials(s, domain)
+            return Session { se_base: base, se_repo: repo, se_hdr: secret_file(dir, "auth.hdr", "Authorization: Basic " + b64_encode(creds) + "\n"), se_dir: dir, se_ok: true, se_error: "" }
+        end
+        return anon
+    end
+    if probe.rs_status != 401 is
+        util::rm_rf(dir)
+        return fail("registry " + base + " answered HTTP " + to_string(probe.rs_status) + " on /v2/")
+    end
+    let challenge: string = header_value(probe.rs_headers, "www-authenticate")
+    let creds2: string = credentials(s, domain)
+    if string_starts_with(string_lower(challenge), "basic") is
+        if creds2 == "" is
+            util::rm_rf(dir)
+            return fail("registry " + domain + " requires credentials (see login)")
+        end
+        return Session { se_base: base, se_repo: repo, se_hdr: secret_file(dir, "auth.hdr", "Authorization: Basic " + b64_encode(creds2) + "\n"), se_dir: dir, se_ok: true, se_error: "" }
+    end
+    let realm: string = challenge_param(challenge, "realm")
+    if realm == "" is
+        util::rm_rf(dir)
+        return fail("unsupported authentication challenge: " + challenge)
+    end
+    let service: string = challenge_param(challenge, "service")
+    let actions: string = if push then "pull,push" else "pull"
+    let scope: string = "repository:" + repo + ":" + actions
+    let mut turl: string = realm + (if string_contains(realm, "?") then "&" else "?")
+    if service != "" is turl = turl + "service=" + url_encode(service) + "&" end
+    turl = turl + "scope=" + url_encode(scope)
+    let mut extra: string = ""
+    if creds2 != "" is extra = "-K " + util::sq(secret_file(dir, "basic.cfg", "user = \"" + string_replace(creds2, "\"", "\\\"") + "\"\n")) end
+    let body: string = dir + "/token.json"
+    let tr: Resp = http(anon, "GET", turl, "", body, extra)
+    if tr.rs_status != 200 is
+        util::rm_rf(dir)
+        return fail("token request to " + realm + " failed with HTTP " + to_string(tr.rs_status))
+    end
+    let tj: string = util::read(body)
+    let tok: string = util::or_default(jx::field_str(tj, "token"), jx::field_str(tj, "access_token"))
+    if tok == "" is
+        util::rm_rf(dir)
+        return fail("registry did not return a token")
+    end
+    return Session { se_base: base, se_repo: repo, se_hdr: secret_file(dir, "auth.hdr", "Authorization: Bearer " + tok + "\n"), se_dir: dir, se_ok: true, se_error: "" }
+end
+
+;; ── Pull ─────────────────────────────────────────────────────────────────────
+
+fn manifest_url(se: Session, ref_or_digest: string) -> string is
+    return se.se_base + "/v2/" + se.se_repo + "/manifests/" + ref_or_digest
+end
+
+fn blob_url(se: Session, d: string) -> string is
+    return se.se_base + "/v2/" + se.se_repo + "/blobs/" + d
+end
+
+;; Downloads a blob into the store, verifying its digest. Skips blobs already present.
+fn fetch_blob(s: store::Store, se: Session, d: string) -> bool is
+    let dst: string = store::blob_path(s, d)
+    if digest::verify_file(d, dst) is return true end
+    let part: string = se.se_dir + "/blob.part"
+    let r: Resp = http(se, "GET", blob_url(se, d), "", part, "")
+    if r.rs_status != 200 is
+        util::eprint("blob " + d + ": HTTP " + to_string(r.rs_status))
+        return false
+    end
+    if !digest::verify_file(d, part) is
+        util::eprint("blob " + d + ": digest mismatch after download")
+        return false
+    end
+    util::quiet("mv " + util::sq(part) + " " + util::sq(dst))
+    return true
+end
+
+fn fetch_manifest(se: Session, ref_or_digest: string) -> string is
+    let out: string = se.se_dir + "/manifest.json"
+    util::quiet("rm -f " + util::sq(out))
+    let r: Resp = http(se, "GET", manifest_url(se, ref_or_digest), accept_manifests(), out, "")
+    if r.rs_status != 200 is
+        util::eprint("manifest " + ref_or_digest + ": HTTP " + to_string(r.rs_status))
+        return ""
+    end
+    return util::read(out)
+end
+
+;; Pulls an image into the store. Returns its image id, or "" on failure.
+pub fn pull(s: store::Store, name: string) -> string is
+    let r: reference::Reference = reference::parse(name)
+    if !r.rf_ok is
+        util::eprint("pull: " + r.rf_error)
+        return ""
+    end
+    let se: Session = open_session(s, r.rf_domain, r.rf_path, false)
+    if !se.se_ok is
+        util::eprint("pull: " + se.se_error)
+        return ""
+    end
+    let mut manifest: string = fetch_manifest(se, reference::api_reference(r))
+    if manifest == "" is
+        close_session(se)
+        return ""
+    end
+    if r.rf_digest != "" && digest::of_string(manifest) != r.rf_digest is
+        util::eprint("pull: manifest does not match the requested digest")
+        close_session(se)
+        return ""
+    end
+    if image::is_index(manifest) is
+        let pick: string = image::pick_manifest(manifest, "linux", util::arch())
+        if pick == "" is
+            util::eprint("pull: no linux/" + util::arch() + " variant of " + reference::canonical(r))
+            close_session(se)
+            return ""
+        end
+        manifest = fetch_manifest(se, pick)
+        if manifest == "" || digest::of_string(manifest) != pick is
+            util::eprint("pull: platform manifest is missing or corrupt")
+            close_session(se)
+            return ""
+        end
+    end
+    if jx::field_int(manifest, "schemaVersion", 0) != 2 is
+        util::eprint("pull: only schema 2 / OCI manifests are supported")
+        close_session(se)
+        return ""
+    end
+    let cfg_digest: string = jx::field_str(jx::field(manifest, "config"), "digest")
+    if !fetch_blob(s, se, cfg_digest) is
+        close_session(se)
+        return ""
+    end
+    let layers: [string] = jx::items(jx::field(manifest, "layers"))
+    let mut i: int = 0
+    while i < array_len(layers) is
+        let ld: string = jx::field_str(layers[i], "digest")
+        util::eprint("layer " + to_string(i + 1) + "/" + to_string(array_len(layers)) + " " + string_slice(digest::hex_of(ld), 0, 12))
+        if !fetch_blob(s, se, ld) is
+            close_session(se)
+            return ""
+        end
+        i += 1
+    end
+    close_session(se)
+    return image::install(s, manifest, [reference::canonical(r)])
+end
+
+;; ── Push ─────────────────────────────────────────────────────────────────────
+
+fn blob_present(se: Session, d: string) -> bool is
+    let r: Resp = http(se, "HEAD", blob_url(se, d), "", "", "-I")
+    return r.rs_status == 200
+end
+
+fn upload_blob(s: store::Store, se: Session, d: string) -> bool is
+    if blob_present(se, d) is return true end
+    let src: string = store::blob_path(s, d)
+    if !util::exists(src) is
+        util::eprint("push: missing local blob " + d)
+        return false
+    end
+    let start: Resp = http(se, "POST", se.se_base + "/v2/" + se.se_repo + "/blobs/uploads/", "", "", "-H 'Content-Length: 0'")
+    if start.rs_status != 202 is
+        util::eprint("push: cannot start upload (HTTP " + to_string(start.rs_status) + ")")
+        return false
+    end
+    let mut loc: string = header_value(start.rs_headers, "location")
+    if string_starts_with(loc, "/") is loc = se.se_base + loc end
+    let sep: string = if string_contains(loc, "?") then "&" else "?"
+    let put: Resp = http(se, "PUT", loc + sep + "digest=" + d, "", "", "-H 'Content-Type: application/octet-stream' -T " + util::sq(src))
+    if put.rs_status != 201 is
+        util::eprint("push: upload of " + d + " failed (HTTP " + to_string(put.rs_status) + ")")
+        return false
+    end
+    return true
+end
+
+;; Pushes a local image to `dest` (e.g. "localhost:5000/team/app:1"). Returns true on success.
+pub fn push(s: store::Store, source: string, dest: string) -> bool is
+    let id: string = image::resolve(s, source)
+    if id == "" is
+        util::eprint("push: unknown image " + source)
+        return false
+    end
+    let r: reference::Reference = reference::parse(dest)
+    if !r.rf_ok is
+        util::eprint("push: " + r.rf_error)
+        return false
+    end
+    let rec: string = s.st_root + "/images/" + id
+    let manifest: string = util::read(rec + "/manifest.json")
+    let se: Session = open_session(s, r.rf_domain, r.rf_path, true)
+    if !se.se_ok is
+        util::eprint("push: " + se.se_error)
+        return false
+    end
+    let mut todo: [string] = [jx::field_str(jx::field(manifest, "config"), "digest")]
+    let layers: [string] = jx::items(jx::field(manifest, "layers"))
+    let mut i: int = 0
+    while i < array_len(layers) is
+        todo = array_push(todo, jx::field_str(layers[i], "digest"))
+        i += 1
+    end
+    let mut k: int = 0
+    while k < array_len(todo) is
+        if !upload_blob(s, se, todo[k]) is
+            close_session(se)
+            return false
+        end
+        k += 1
+    end
+    let mtype: string = util::or_default(jx::field_str(manifest, "mediaType"), "application/vnd.oci.image.manifest.v1+json")
+    let mfile: string = se.se_dir + "/push-manifest.json"
+    util::write_file(mfile, manifest)
+    let ref_part: string = if r.rf_digest != "" then r.rf_digest else r.rf_tag
+    let put: Resp = http(se, "PUT", manifest_url(se, ref_part), "", "", "-H " + util::sq("Content-Type: " + mtype) + " --data-binary @" + util::sq(mfile))
+    close_session(se)
+    if put.rs_status != 201 && put.rs_status != 200 is
+        util::eprint("push: manifest upload failed (HTTP " + to_string(put.rs_status) + ")")
+        return false
+    end
+    return true
+end
