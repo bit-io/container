@@ -1,0 +1,206 @@
+mod util
+mod jx
+mod digest
+mod reference
+mod store
+mod image
+mod spec
+mod cgroup
+mod network
+mod runtime
+mod registry
+mod build
+
+fn check(cond: bool, msg: string) is
+    assert(cond, msg)
+end
+
+fn same(a: string, b: string, what: string) is
+    assert(a == b, what + ": expected [" + b + "] got [" + a + "]")
+end
+
+fn same_int(a: int, b: int, what: string) is
+    assert(a == b, what + ": expected " + to_string(b) + " got " + to_string(a))
+end
+
+fn can_run() -> bool is
+    return util::is_root() && util::tool_exists("unshare") && util::tool_exists("pivot_root") && util::tool_exists("setpriv") && util::quiet("unshare --mount --uts --pid --fork true") == 0
+end
+
+fn make_rootfs(dir: string) is
+    util::mkdir_p(dir + "/proc")
+    util::mkdir_p(dir + "/dev")
+    util::mkdir_p(dir + "/sys")
+    util::mkdir_p(dir + "/tmp")
+    util::mkdir_p(dir + "/etc")
+    let tools: string = "sh echo cat ls mkdir touch rm env hostname id sleep true false pwd ln readlink cp grep head"
+    util::quiet("for b in " + tools + "; do p=$(which $b 2>/dev/null); [ -n \"$p\" ] || continue; cp --parents -L \"$p\" " + util::sq(dir) + "/; for l in $(ldd \"$p\" 2>/dev/null | grep -o '/[^ ]*'); do cp --parents -L \"$l\" " + util::sq(dir) + "/; done; done")
+    if util::is_dir("/bin") && util::capture("readlink /bin") != "" is util::quiet("ln -s usr/bin " + util::sq(dir + "/bin")) end
+    util::write_file(dir + "/etc/passwd", "root:x:0:0:root:/root:/bin/sh\n")
+    util::write_file(dir + "/etc/group", "root:x:0:\n")
+end
+
+fn base_store(dir: string) -> store::Store is
+    make_rootfs(dir + "/rootfs")
+    util::quiet("tar -cf " + util::sq(dir + "/rootfs.tar") + " -C " + util::sq(dir + "/rootfs") + " .")
+    let s: store::Store = store::open(dir + "/store", dir + "/run", "vfs")
+    image::import_rootfs(s, dir + "/rootfs.tar", "mini:1", image::new_config())
+    return s
+end
+
+;; ── Parsing ──────────────────────────────────────────────────────────────────
+
+#[test]
+fn build_joins_continuations_and_skips_comments() is
+    let ls: [string] = build::logical_lines("# comment\nFROM a\n\nRUN one \\\n    two \\\n    three\nCMD [\"x\"]\n")
+    same_int(array_len(ls), 3, "three instructions")
+    same(ls[0], "FROM a", "from")
+    same(ls[1], "RUN one two three", "joined")
+    same(build::instruction_of("run echo hi"), "RUN", "case-insensitive")
+    same(build::arguments_of("RUN echo   hi"), "echo   hi", "arguments")
+end
+
+#[test]
+fn build_expands_variables() is
+    let vars: [string] = ["NAME=world", "VER=1.2"]
+    same(build::substitute("hello $NAME", vars), "hello world", "plain")
+    same(build::substitute("v${{VER}}-x", vars), "v1.2-x", "braces")
+    same(build::substitute("$MISSING|", vars), "|", "unknown is empty")
+    same(build::substitute("cost \\$5 and $", vars), "cost $5 and $", "escaped and lone dollar")
+end
+
+#[test]
+fn build_parses_key_values_and_exec_forms() is
+    let kv: [string] = build::key_values("A=1 B=\"two words\" C='x y'")
+    same_int(array_len(kv), 3, "three pairs")
+    same(kv[1], "B=two words", "double quotes")
+    same(kv[2], "C=x y", "single quotes")
+    same(build::key_values("LEGACY some value")[0], "LEGACY=some value", "legacy form")
+    same(util::join(build::exec_or_shell("[\"/bin/app\", \"-v\"]"), "|"), "/bin/app|-v", "exec form")
+    same(util::join(build::exec_or_shell("echo hi"), "|"), "/bin/sh|-c|echo hi", "shell form")
+end
+
+;; ── Building ─────────────────────────────────────────────────────────────────
+
+#[test]
+fn build_from_scratch_with_copy_and_metadata() is
+    let dir: string = util::capture("mktemp -d")
+    let s: store::Store = store::open(dir + "/store", dir + "/run", "vfs")
+    util::write_file(dir + "/ctx/app/hello.txt", "hello\n")
+    util::write_file(dir + "/ctx/app/sub/deep.txt", "deep\n")
+    util::write_file(dir + "/ctx/single.cfg", "k=v\n")
+    util::write_file(dir + "/ctx/Containerfile", "FROM scratch\nARG VERSION=7\nENV APP_VERSION=$VERSION\nWORKDIR /srv\nCOPY app/ /srv/app/\nCOPY single.cfg /etc/single.cfg\nLABEL org.example.name=demo\nEXPOSE 8080 53/udp\nVOLUME /data\nUSER 1000:1000\nENTRYPOINT [\"/srv/app/run\"]\nCMD [\"--serve\"]\n")
+    let id: string = build::build_image(s, dir + "/ctx", "", "demo:1", [], "none")
+    check(string_len(id) == 64, "built")
+    same(image::resolve(s, "demo:1"), id, "tagged")
+    let cfg: image::ImageConfig = image::config_of(s, id)
+    same(util::join(cfg.ic_env, ","), "APP_VERSION=7", "ARG substitution into ENV")
+    same(cfg.ic_workdir, "/srv", "workdir")
+    same(cfg.ic_user, "1000:1000", "user")
+    same(util::join(cfg.ic_entrypoint, " "), "/srv/app/run", "entrypoint")
+    same(util::join(cfg.ic_cmd, " "), "--serve", "cmd")
+    same(util::join(cfg.ic_ports, ","), "8080/tcp,53/udp", "ports")
+    same(util::join(cfg.ic_volumes, ","), "/data", "volumes")
+    same(util::join(cfg.ic_labels, ","), "org.example.name=demo", "labels")
+    same_int(array_len(cfg.ic_diff_ids), 2, "one layer per COPY")
+    let top: string = store::layers_dir(s) + "/" + image::layer_chains(s, id)[1] + "/diff"
+    same(util::read_trim(top + "/srv/app/hello.txt"), "hello", "directory contents copied")
+    check(util::is_file(top + "/srv/app/sub/deep.txt"), "nested files")
+    same(util::read_trim(top + "/etc/single.cfg"), "k=v", "single file")
+    util::rm_rf(dir)
+end
+
+#[test]
+fn build_overrides_arguments() is
+    let dir: string = util::capture("mktemp -d")
+    let s: store::Store = store::open(dir + "/store", dir + "/run", "vfs")
+    util::write_file(dir + "/ctx/Containerfile", "FROM scratch\nARG TARGET=dev\nENV MODE=$TARGET\n")
+    let id: string = build::build_image(s, dir + "/ctx", "", "args:1", ["TARGET=prod"], "none")
+    same(util::join(image::config_of(s, id).ic_env, ","), "MODE=prod", "build arg wins over the default")
+    util::rm_rf(dir)
+end
+
+#[test]
+fn build_rejects_unsupported_and_broken_files() is
+    let dir: string = util::capture("mktemp -d")
+    let s: store::Store = store::open(dir + "/store", dir + "/run", "vfs")
+    util::write_file(dir + "/a/Containerfile", "RUN echo no from\n")
+    same(build::build_image(s, dir + "/a", "", "x:1", [], "none"), "", "FROM must come first")
+    util::write_file(dir + "/b/Containerfile", "FROM scratch\nFROM scratch\n")
+    same(build::build_image(s, dir + "/b", "", "x:1", [], "none"), "", "multi-stage")
+    util::write_file(dir + "/c/Containerfile", "FROM scratch\nCOPY missing.txt /x\n")
+    same(build::build_image(s, dir + "/c", "", "x:1", [], "none"), "", "missing source")
+    util::write_file(dir + "/d/Containerfile", "FROM scratch\nFROBNICATE now\n")
+    same(build::build_image(s, dir + "/d", "", "x:1", [], "none"), "", "unknown instruction")
+    util::write_file(dir + "/e/Containerfile", "FROM scratch\nCOPY ../secret /x\n")
+    same(build::build_image(s, dir + "/e", "", "x:1", [], "none"), "", "no escaping the context")
+    same(build::build_image(s, dir + "/nothing", "", "x:1", [], "none"), "", "no Containerfile")
+    same_int(array_len(image::image_ids(s)), 0, "failed builds register nothing")
+    util::rm_rf(dir)
+end
+
+#[test]
+fn build_runs_commands_and_records_changes_as_layers() is
+    if !can_run() is return end
+    let dir: string = util::capture("mktemp -d")
+    let s: store::Store = base_store(dir)
+    util::write_file(dir + "/ctx/src/hello.txt", "hello\n")
+    util::write_file(dir + "/ctx/Containerfile", "FROM mini:1\nARG GREETING=hi\nENV MSG=$GREETING-world\nWORKDIR /app\nCOPY src/ /app/\nRUN echo $MSG > /app/msg && rm /etc/group && mkdir -p /var/data && echo made > /var/data/f\nRUN true\nCMD [\"/bin/cat\", \"/app/msg\"]\n")
+    let id: string = build::build_image(s, dir + "/ctx", "", "built:1", [], "host")
+    check(id != "", "built")
+    let cfg: image::ImageConfig = image::config_of(s, id)
+    same_int(array_len(cfg.ic_diff_ids), 3, "base + COPY + RUN (the no-op RUN adds no layer)")
+    same_int(array_len(cfg.ic_history), 7, "history keeps every step")
+    let top: string = store::layers_dir(s) + "/" + image::layer_chains(s, id)[2] + "/diff"
+    same(util::read_trim(top + "/app/msg"), "hi-world", "RUN saw the ENV/ARG values")
+    check(!util::exists(top + "/etc/group"), "deleted file is gone in the flattened layer")
+    same(util::read_trim(top + "/var/data/f"), "made", "new directory content")
+    check(util::exists(top + "/app/hello.txt"), "COPY content still there")
+    check(!util::exists(top + "/.po"), "no pivot leftovers in the image")
+    let mut o: runtime::Options = runtime::options("built:1")
+    o = runtime::opt(o, "network", "host")
+    o = runtime::opt(o, "detach", "true")
+    let c: string = runtime::create(s, o)
+    runtime::start(s, c, false)
+    same_int(runtime::wait(s, c, 20000), 0, "built image runs")
+    check(string_contains(runtime::logs(s, c), "hi-world"), "CMD output: " + runtime::logs(s, c))
+    runtime::remove(s, c, true)
+    let mut base_only: runtime::Options = runtime::options("mini:1")
+    base_only = runtime::opt(base_only, "network", "host")
+    base_only = runtime::opt(base_only, "detach", "true")
+    base_only = runtime::opt_add(base_only, "arg", "/bin/ls")
+    base_only = runtime::opt_add(base_only, "arg", "/etc")
+    let b: string = runtime::create(s, base_only)
+    runtime::start(s, b, false)
+    runtime::wait(s, b, 20000)
+    check(string_contains(runtime::logs(s, b), "group"), "the base image still has /etc/group")
+    util::rm_rf(dir)
+end
+
+#[test]
+fn build_whiteouts_survive_export_and_import() is
+    if !can_run() is return end
+    let dir: string = util::capture("mktemp -d")
+    let s: store::Store = base_store(dir)
+    util::write_file(dir + "/ctx/Containerfile", "FROM mini:1\nRUN rm /etc/group\n")
+    let id: string = build::build_image(s, dir + "/ctx", "", "wh:1", [], "none")
+    check(id != "", "built")
+    check(image::export_layout(s, "wh:1", dir + "/oci"), "export")
+    let other: store::Store = store::open(dir + "/store2", dir + "/run2", "vfs")
+    same(image::import_layout(other, dir + "/oci", ""), id, "same id after the round trip")
+    let top: string = store::layers_dir(other) + "/" + image::layer_chains(other, id)[1] + "/diff"
+    check(!util::exists(top + "/etc/group"), "the OCI .wh. marker was applied on import")
+    check(util::is_file(top + "/etc/passwd"), "other files survive")
+    util::rm_rf(dir)
+end
+
+#[test]
+fn build_fails_when_a_run_step_fails() is
+    if !can_run() is return end
+    let dir: string = util::capture("mktemp -d")
+    let s: store::Store = base_store(dir)
+    util::write_file(dir + "/ctx/Containerfile", "FROM mini:1\nRUN exit 3\nCMD [\"/bin/true\"]\n")
+    same(build::build_image(s, dir + "/ctx", "", "bad:1", [], "none"), "", "failing RUN aborts the build")
+    check(!image::exists(s, "bad:1"), "nothing tagged")
+    util::rm_rf(dir)
+end
