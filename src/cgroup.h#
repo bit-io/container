@@ -1,0 +1,153 @@
+mod util
+
+pub fn version() -> int is
+    if util::capture("stat -fc %T /sys/fs/cgroup 2>/dev/null") == "cgroup2fs" is return 2 end
+    return 1
+end
+
+pub fn root_dir() -> string is
+    return "/sys/fs/cgroup"
+end
+
+;; Directories that make up the group `name` (one on v2; one per controller on v1).
+pub fn dirs(name: string) -> [string] is
+    if version() == 2 is return [root_dir() + "/container/" + name] end
+    let mut out: [string] = []
+    let ctls: [string] = ["memory", "cpu", "pids", "cpuacct", "blkio"]
+    let mut i: int = 0
+    while i < array_len(ctls) is
+        if util::is_dir(root_dir() + "/" + ctls[i]) is out = array_push(out, root_dir() + "/" + ctls[i] + "/container/" + name) end
+        i += 1
+    end
+    return out
+end
+
+fn put(path: string, value: string) -> bool is
+    return util::quiet("printf '%s' " + util::sq(value) + " > " + util::sq(path)) == 0
+end
+
+;; cpu.shares (2..262144) -> cgroup v2 cpu.weight (1..10000)
+pub fn shares_to_weight(shares: int) -> int is
+    if shares < 2 is return 1 end
+    return 1 + ((shares - 2) * 9999) / 262142
+end
+
+;; True when this process may create groups.
+pub fn available() -> bool is
+    if !util::is_root() is return false end
+    if version() == 2 is return util::is_dir(root_dir()) end
+    return util::is_dir(root_dir() + "/memory") || util::is_dir(root_dir() + "/pids")
+end
+
+;; Creates the group and applies limits (0 = unlimited). Returns false when it could not be created.
+pub fn create(name: string, mem: int, cpu_quota: int, cpu_period: int, pids: int, shares: int) -> bool is
+    if !available() is return false end
+    let ds: [string] = dirs(name)
+    if array_len(ds) == 0 is return false end
+    if version() == 2 is
+        let parent: string = root_dir() + "/container"
+        util::mkdir_p(parent)
+        put(root_dir() + "/cgroup.subtree_control", "+cpu +memory +pids")
+        put(parent + "/cgroup.subtree_control", "+cpu +memory +pids")
+        util::mkdir_p(ds[0])
+        if mem > 0 is put(ds[0] + "/memory.max", to_string(mem)) end
+        if cpu_quota > 0 is put(ds[0] + "/cpu.max", to_string(cpu_quota) + " " + to_string(cpu_period)) end
+        if shares > 0 is put(ds[0] + "/cpu.weight", to_string(shares_to_weight(shares))) end
+        if pids > 0 is put(ds[0] + "/pids.max", to_string(pids)) end
+        return util::is_dir(ds[0])
+    end
+    let mut made: bool = false
+    let mut i: int = 0
+    while i < array_len(ds) is
+        util::mkdir_p(ds[i])
+        if util::is_dir(ds[i]) is made = true end
+        let ctl: string = util::basename(util::dirname(util::dirname(ds[i])))
+        if ctl == "memory" && mem > 0 is
+            put(ds[i] + "/memory.limit_in_bytes", to_string(mem))
+            put(ds[i] + "/memory.memsw.limit_in_bytes", to_string(mem))
+        end
+        if ctl == "cpu" is
+            if cpu_quota > 0 is
+                put(ds[i] + "/cpu.cfs_period_us", to_string(cpu_period))
+                put(ds[i] + "/cpu.cfs_quota_us", to_string(cpu_quota))
+            end
+            if shares > 0 is put(ds[i] + "/cpu.shares", to_string(shares)) end
+        end
+        if ctl == "pids" && pids > 0 is put(ds[i] + "/pids.max", to_string(pids)) end
+        i += 1
+    end
+    return made
+end
+
+pub fn exists(name: string) -> bool is
+    let ds: [string] = dirs(name)
+    let mut i: int = 0
+    while i < array_len(ds) is
+        if util::is_dir(ds[i]) is return true end
+        i += 1
+    end
+    return false
+end
+
+;; Moves a process (by host pid) into the group.
+pub fn add_pid(name: string, pid: int) -> bool is
+    let ds: [string] = dirs(name)
+    let mut ok: bool = false
+    let mut i: int = 0
+    while i < array_len(ds) is
+        if put(ds[i] + "/cgroup.procs", to_string(pid)) is ok = true end
+        i += 1
+    end
+    return ok
+end
+
+pub fn procs(name: string) -> [string] is
+    let ds: [string] = dirs(name)
+    if array_len(ds) == 0 is return [] end
+    return util::lines(util::read(ds[0] + "/cgroup.procs"))
+end
+
+;; Kills everything in the group (cgroup.kill on recent v2 kernels, SIGKILL loop otherwise).
+pub fn kill_all(name: string) is
+    let ds: [string] = dirs(name)
+    if array_len(ds) == 0 is return end
+    if version() == 2 && util::exists(ds[0] + "/cgroup.kill") is
+        put(ds[0] + "/cgroup.kill", "1")
+        return
+    end
+    let mut tries: int = 0
+    while tries < 5 && array_len(procs(name)) > 0 is
+        let ps: [string] = procs(name)
+        let mut i: int = 0
+        while i < array_len(ps) is
+            util::quiet("kill -9 " + ps[i])
+            i += 1
+        end
+        util::quiet("sleep 0.1")
+        tries += 1
+    end
+end
+
+pub fn remove(name: string) -> bool is
+    let ds: [string] = dirs(name)
+    let mut ok: bool = true
+    let mut i: int = 0
+    while i < array_len(ds) is
+        if util::is_dir(ds[i]) && util::quiet("rmdir " + util::sq(ds[i])) != 0 is ok = false end
+        i += 1
+    end
+    return ok
+end
+
+;; Current memory use in bytes (0 when unknown).
+pub fn memory_usage(name: string) -> int is
+    let ds: [string] = dirs(name)
+    if array_len(ds) == 0 is return 0 end
+    if version() == 2 is return util::atoi(util::read(ds[0] + "/memory.current")) end
+    let mut i: int = 0
+    while i < array_len(ds) is
+        if string_contains(ds[i], "/memory/") is return util::atoi(util::read(ds[i] + "/memory.usage_in_bytes")) end
+        i += 1
+    end
+    return 0
+end
