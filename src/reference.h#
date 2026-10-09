@@ -1,0 +1,174 @@
+mod util
+
+pub struct Reference is
+    pub rf_domain: string    ;; registry, "docker.io" for Docker Hub
+    pub rf_path:   string    ;; repository, "library/alpine"
+    pub rf_tag:    string    ;; "latest" unless a digest was given
+    pub rf_digest: string    ;; "sha256:<hex>" or ""
+    pub rf_ok:     bool
+    pub rf_error:  string
+end
+
+fn bad(why: string) -> Reference is
+    return Reference { rf_domain: "", rf_path: "", rf_tag: "", rf_digest: "", rf_ok: false, rf_error: why }
+end
+
+fn is_lower_alnum(c: string) -> bool is
+    let set: string = "abcdefghijklmnopqrstuvwxyz0123456789"
+    return string_len(c) == 1 && string_find(set, c) >= 0
+end
+
+;; One path component: lower-case alphanumerics separated by `.`, `_`, `__` or `-`.
+fn valid_component(c: string) -> bool is
+    let n: int = string_len(c)
+    if n == 0 || n > 255 is return false end
+    if !is_lower_alnum(string_at(c, 0)) || !is_lower_alnum(string_at(c, n - 1)) is return false end
+    let seps: string = "._-"
+    let mut i: int = 0
+    while i < n is
+        let ch: string = string_at(c, i)
+        if !is_lower_alnum(ch) && string_find(seps, ch) < 0 is return false end
+        i += 1
+    end
+    return true
+end
+
+pub fn valid_repository(path: string) -> bool is
+    if path == "" || string_len(path) > 255 is return false end
+    let parts: [string] = string_split(path, "/")
+    let mut i: int = 0
+    while i < array_len(parts) is
+        if !valid_component(parts[i]) is return false end
+        i += 1
+    end
+    return true
+end
+
+pub fn valid_tag(tag: string) -> bool is
+    let n: int = string_len(tag)
+    if n == 0 || n > 128 is return false end
+    let word: string = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
+    let rest: string = word + ".-"
+    if string_find(word, string_at(tag, 0)) < 0 is return false end
+    let mut i: int = 1
+    while i < n is
+        if string_find(rest, string_at(tag, i)) < 0 is return false end
+        i += 1
+    end
+    return true
+end
+
+pub fn valid_digest(d: string) -> bool is
+    if string_starts_with(d, "sha256:") is
+        let h: string = string_slice(d, 7, string_len(d))
+        return string_len(h) == 64 && util::is_hex(h)
+    end
+    if string_starts_with(d, "sha512:") is
+        let h2: string = string_slice(d, 7, string_len(d))
+        return string_len(h2) == 128 && util::is_hex(h2)
+    end
+    return false
+end
+
+fn looks_like_domain(first: string) -> bool is
+    return string_contains(first, ".") || string_contains(first, ":") || first == "localhost"
+end
+
+pub fn parse(input: string) -> Reference is
+    let mut s: string = string_trim(input)
+    if string_starts_with(s, "docker://") is s = string_slice(s, 9, string_len(s)) end
+    if s == "" is return bad("empty image reference") end
+    if string_contains(s, " ") is return bad("image reference contains whitespace: " + s) end
+
+    let mut digest: string = ""
+    let at: int = string_find(s, "@")
+    if at >= 0 is
+        digest = string_slice(s, at + 1, string_len(s))
+        s = string_slice(s, 0, at)
+        if !valid_digest(digest) is return bad("invalid digest '" + digest + "'") end
+    end
+
+    let mut tag: string = ""
+    let colon: int = util::last_index(s, ":")
+    let slash: int = util::last_index(s, "/")
+    if colon > slash is
+        tag = string_slice(s, colon + 1, string_len(s))
+        s = string_slice(s, 0, colon)
+        if !valid_tag(tag) is return bad("invalid tag '" + tag + "'") end
+    end
+
+    let mut domain: string = "docker.io"
+    let mut path: string = s
+    let first_slash: int = string_find(s, "/")
+    if first_slash > 0 is
+        let first: string = string_slice(s, 0, first_slash)
+        if looks_like_domain(first) is
+            domain = first
+            path = string_slice(s, first_slash + 1, string_len(s))
+        end
+    end
+    if domain == "index.docker.io" || domain == "registry-1.docker.io" is domain = "docker.io" end
+    if domain == "docker.io" && !string_contains(path, "/") is path = "library/" + path end
+
+    if !valid_repository(path) is return bad("invalid repository name '" + path + "'") end
+    if tag == "" && digest == "" is tag = "latest" end
+    return Reference { rf_domain: domain, rf_path: path, rf_tag: tag, rf_digest: digest, rf_ok: true, rf_error: "" }
+end
+
+;; docker.io/library/alpine:latest
+pub fn canonical(r: Reference) -> string is
+    let mut out: string = r.rf_domain + "/" + r.rf_path
+    if r.rf_tag != "" is out = out + ":" + r.rf_tag end
+    if r.rf_digest != "" is out = out + "@" + r.rf_digest end
+    return out
+end
+
+;; alpine:latest  (Docker Hub library images lose their prefix)
+pub fn familiar(r: Reference) -> string is
+    let mut name: string = r.rf_domain + "/" + r.rf_path
+    if r.rf_domain == "docker.io" is
+        name = r.rf_path
+        if string_starts_with(name, "library/") is name = string_slice(name, 8, string_len(name)) end
+    end
+    if r.rf_tag != "" is name = name + ":" + r.rf_tag end
+    if r.rf_digest != "" is name = name + "@" + r.rf_digest end
+    return name
+end
+
+;; Repository without tag / digest: docker.io/library/alpine
+pub fn name_only(r: Reference) -> string is
+    return r.rf_domain + "/" + r.rf_path
+end
+
+;; Host that actually serves the registry API.
+pub fn api_host(r: Reference) -> string is
+    if r.rf_domain == "docker.io" is return "registry-1.docker.io" end
+    return r.rf_domain
+end
+
+;; What goes after /manifests/ — the digest when pinned, else the tag.
+pub fn api_reference(r: Reference) -> string is
+    if r.rf_digest != "" is return r.rf_digest end
+    return r.rf_tag
+end
+
+pub fn with_tag(r: Reference, tag: string) -> Reference is
+    return Reference { rf_domain: r.rf_domain, rf_path: r.rf_path, rf_tag: tag, rf_digest: "", rf_ok: r.rf_ok, rf_error: r.rf_error }
+end
+
+pub fn with_digest(r: Reference, digest: string) -> Reference is
+    return Reference { rf_domain: r.rf_domain, rf_path: r.rf_path, rf_tag: "", rf_digest: digest, rf_ok: r.rf_ok, rf_error: r.rf_error }
+end
+
+;; Plain HTTP is used for loopback registries and for hosts listed in
+;; CONTAINER_INSECURE_REGISTRIES (comma separated).
+pub fn is_insecure(domain: string) -> bool is
+    let host: string = util::head_before(domain, ":")
+    if host == "localhost" || host == "127.0.0.1" || host == "::1" is return true end
+    return util::has(util::csv(util::p_env("CONTAINER_INSECURE_REGISTRIES")), domain)
+end
+
+pub fn scheme_for(domain: string) -> string is
+    if is_insecure(domain) is return "http" end
+    return "https"
+end
