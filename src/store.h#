@@ -1,0 +1,89 @@
+mod util
+mod jx
+
+pub struct Store is
+    pub st_root:   string
+    pub st_run:    string
+    pub st_driver: string
+end
+
+pub fn default_root() -> string is
+    let env: string = util::p_env("CONTAINER_ROOT")
+    if env != "" is return env end
+    if util::is_root() is return "/var/lib/container" end
+    let data: string = util::p_env("XDG_DATA_HOME")
+    if data != "" is return data + "/container" end
+    return util::or_default(util::p_env("HOME"), "/tmp") + "/.local/share/container"
+end
+
+pub fn default_run() -> string is
+    let env: string = util::p_env("CONTAINER_RUNROOT")
+    if env != "" is return env end
+    if util::is_root() is return "/run/container" end
+    let xdg: string = util::p_env("XDG_RUNTIME_DIR")
+    if xdg != "" is return xdg + "/container" end
+    return "/tmp/container-run-" + util::capture("id -u")
+end
+
+;; True when this host can mount overlayfs (root, kernel support, a trial mount works).
+pub fn overlay_usable() -> bool is
+    if !util::is_root() is return false end
+    if !util::tool_exists("setfattr") is return false end
+    if !string_contains(util::read("/proc/filesystems"), "overlay") is return false end
+    let t: string = util::capture("mktemp -d")
+    if t == "" is return false end
+    util::mkdir_p(t + "/l")
+    util::mkdir_p(t + "/u")
+    util::mkdir_p(t + "/w")
+    util::mkdir_p(t + "/m")
+    let rc: int = util::quiet("mount -t overlay overlay -o lowerdir=" + util::sq(t + "/l") + ",upperdir=" + util::sq(t + "/u") + ",workdir=" + util::sq(t + "/w") + " " + util::sq(t + "/m"))
+    if rc == 0 is util::quiet("umount " + util::sq(t + "/m")) end
+    util::rm_rf(t)
+    return rc == 0
+end
+
+;; Opens (creating when needed) a store.  driver: "" = remembered / auto, "vfs" or "overlay".
+pub fn open(root: string, run_root: string, driver: string) -> Store is
+    let r: string = util::or_default(root, default_root())
+    let run: string = util::or_default(run_root, default_run())
+    util::mkdir_p(r + "/blobs/sha256")
+    util::mkdir_p(r + "/layers")
+    util::mkdir_p(r + "/images")
+    util::mkdir_p(r + "/containers")
+    util::mkdir_p(r + "/tmp")
+    util::mkdir_p(run)
+    let conf: string = util::read(r + "/store.json")
+    let mut drv: string = driver
+    if drv == "" is drv = jx::field_str(conf, "driver") end
+    if drv == "" is
+        drv = util::p_env("CONTAINER_DRIVER")
+    end
+    if drv == "" is
+        if overlay_usable() is drv = "overlay" else is drv = "vfs" end
+    end
+    if drv != "vfs" && drv != "overlay" is drv = "vfs" end
+    if conf == "" || jx::field_str(conf, "driver") != drv is
+        util::write_file(r + "/store.json", jx::obj([jx::kv("version", "1"), jx::kv("driver", jx::q(drv))]) + "\n")
+    end
+    return Store { st_root: r, st_run: run, st_driver: drv }
+end
+
+pub fn images_dir(s: Store) -> string is return s.st_root + "/images" end
+pub fn layers_dir(s: Store) -> string is return s.st_root + "/layers" end
+pub fn containers_dir(s: Store) -> string is return s.st_root + "/containers" end
+pub fn tmp_dir(s: Store) -> string is return s.st_root + "/tmp" end
+pub fn blobs_dir(s: Store) -> string is return s.st_root + "/blobs/sha256" end
+
+;; Path a blob with this digest has (or would have) in the store.
+pub fn blob_path(s: Store, digest: string) -> string is
+    let i: int = string_find(digest, ":")
+    let hex: string = if i < 0 then digest else string_slice(digest, i + 1, string_len(digest))
+    return blobs_dir(s) + "/" + hex
+end
+
+;; A fresh scratch directory inside the store (so renames stay on one filesystem).
+pub fn scratch(s: Store, prefix: string) -> string is
+    let d: string = tmp_dir(s) + "/" + prefix + "-" + util::rand_hex(6)
+    util::mkdir_p(d)
+    return d
+end
