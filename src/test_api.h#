@@ -1,0 +1,121 @@
+mod util
+mod lib
+
+fn check(cond: bool, msg: string) is
+    assert(cond, msg)
+end
+
+fn same(a: string, b: string, what: string) is
+    assert(a == b, what + ": expected [" + b + "] got [" + a + "]")
+end
+
+fn same_int(a: int, b: int, what: string) is
+    assert(a == b, what + ": expected " + to_string(b) + " got " + to_string(a))
+end
+
+fn can_run() -> bool is
+    return util::is_root() && util::tool_exists("unshare") && util::tool_exists("pivot_root") && util::tool_exists("setpriv") && util::quiet("unshare --mount --uts --pid --fork true") == 0
+end
+
+fn make_rootfs(dir: string) is
+    util::mkdir_p(dir + "/proc")
+    util::mkdir_p(dir + "/dev")
+    util::mkdir_p(dir + "/sys")
+    util::mkdir_p(dir + "/tmp")
+    util::mkdir_p(dir + "/etc")
+    let tools: string = "sh echo cat ls mkdir touch rm env hostname id sleep true false pwd ln readlink cp grep head"
+    util::quiet("for b in " + tools + "; do p=$(which $b 2>/dev/null); [ -n \"$p\" ] || continue; cp --parents -L \"$p\" " + util::sq(dir) + "/; for l in $(ldd \"$p\" 2>/dev/null | grep -o '/[^ ]*'); do cp --parents -L \"$l\" " + util::sq(dir) + "/; done; done")
+    if util::is_dir("/bin") && util::capture("readlink /bin") != "" is util::quiet("ln -s usr/bin " + util::sq(dir + "/bin")) end
+    util::write_file(dir + "/etc/passwd", "root:x:0:0:root:/root:/bin/sh\n")
+end
+
+#[test]
+fn api_version_and_references() is
+    same(lib::version(), "0.1.0", "version")
+    let r = lib::parse_reference("ghcr.io/org/app:2")
+    check(r.rf_ok, "parsed")
+    same(lib::reference_canonical(r), "ghcr.io/org/app:2", "canonical")
+    same(lib::reference_familiar(lib::parse_reference("library/alpine")), "alpine:latest", "familiar")
+    check(lib::digest_valid(lib::digest_of_string("abc")), "digest")
+    check(string_len(util::join(lib::doctor(), "\n")) > 0, "doctor prints something")
+end
+
+#[test]
+fn api_images_import_inspect_tag_export_remove() is
+    let dir: string = util::capture("mktemp -d")
+    util::write_file(dir + "/root/hello", "hi\n")
+    util::quiet("tar -cf " + util::sq(dir + "/root.tar") + " -C " + util::sq(dir + "/root") + " .")
+    let s = lib::open_store(dir + "/store", dir + "/run", "vfs")
+    let mut cfg = lib::image_new_config()
+    cfg.ic_cmd = ["/hello"]
+    let id: string = lib::image_import_with(s, dir + "/root.tar", "api:1", cfg)
+    check(string_len(id) == 64, "imported")
+    check(lib::image_exists(s, "api:1"), "exists")
+    same(lib::image_resolve(s, "api:1"), id, "resolve")
+    same_int(array_len(lib::image_list(s)), 1, "listed")
+    check(string_contains(lib::image_inspect(s, "api:1"), "RepoTags"), "inspect")
+    same(lib::image_config(s, "api:1").ic_cmd[0], "/hello", "config")
+    check(lib::image_tag(s, "api:1", "other/name:2"), "tag")
+    check(lib::image_export(s, "other/name:2", dir + "/oci"), "export")
+    let s2 = lib::open_store(dir + "/store2", dir + "/run2", "vfs")
+    same(lib::image_load(s2, dir + "/oci", ""), id, "load")
+    check(lib::image_remove(s, "api:1", false), "untag")
+    check(lib::image_remove(s, "other/name:2", false), "remove")
+    lib::image_gc(s)
+    same_int(array_len(lib::image_list(s)), 0, "empty")
+    util::rm_rf(dir)
+end
+
+#[test]
+fn api_run_a_container_and_read_its_output() is
+    if !can_run() is return end
+    let dir: string = util::capture("mktemp -d")
+    make_rootfs(dir + "/rootfs")
+    util::quiet("tar -cf " + util::sq(dir + "/rootfs.tar") + " -C " + util::sq(dir + "/rootfs") + " .")
+    util::mkdir_p(dir + "/out")
+    let s = lib::open_store(dir + "/store", dir + "/run", "vfs")
+    check(lib::image_import(s, dir + "/rootfs.tar", "mini:1") != "", "image")
+    let mut o = lib::container_options("mini:1")
+    o = lib::set_option(o, "name", "apitest")
+    o = lib::set_option(o, "network", "host")
+    o = lib::set_option(o, "hostname", "apibox")
+    o = lib::add_option(o, "env", "WHO=api")
+    o = lib::add_option(o, "volume", dir + "/out:/out")
+    o = lib::set_command(o, ["/bin/sh", "-c", "echo $WHO on $(hostname) > /out/result; echo logged; exit 3"])
+    let id: string = lib::container_create(s, o)
+    check(id != "", "created")
+    same(lib::container_find(s, "apitest"), id, "find by name")
+    same(lib::container_status(s, id), "created", "status")
+    same_int(lib::container_start(s, id, false), 0, "started")
+    same_int(lib::container_wait(s, id, 20000), 3, "exit code")
+    same(lib::container_status(s, id), "exited", "exited")
+    same(util::read_trim(dir + "/out/result"), "api on apibox", "output file")
+    check(string_contains(lib::container_logs(s, id), "logged"), "logs")
+    check(string_contains(lib::container_inspect(s, id), "apibox") || string_contains(lib::container_inspect(s, id), "ExitCode"), "inspect")
+    same_int(array_len(lib::container_list(s)), 1, "listed")
+    check(util::is_file(lib::container_bundle(s, id) + "/config.json"), "OCI bundle")
+    check(lib::container_remove(s, id, false), "removed")
+    util::rm_rf(dir)
+end
+
+#[test]
+fn api_build_then_run() is
+    if !can_run() is return end
+    let dir: string = util::capture("mktemp -d")
+    make_rootfs(dir + "/rootfs")
+    util::quiet("tar -cf " + util::sq(dir + "/rootfs.tar") + " -C " + util::sq(dir + "/rootfs") + " .")
+    util::mkdir_p(dir + "/out")
+    util::quiet("chmod 777 " + util::sq(dir + "/out"))
+    let s = lib::open_store(dir + "/store", dir + "/run", "vfs")
+    lib::image_import(s, dir + "/rootfs.tar", "mini:1")
+    util::write_file(dir + "/ctx/Containerfile", "FROM mini:1\nRUN echo built-in-run > /stamp\nCMD [\"/bin/sh\", \"-c\", \"cat /stamp > /out/stamp\"]\n")
+    let id: string = lib::build_image(s, dir + "/ctx", "", "app:1", [], "none")
+    check(id != "", "built")
+    let mut o = lib::container_options("app:1")
+    o = lib::set_option(o, "network", "none")
+    o = lib::set_option(o, "rm", "true")
+    o = lib::add_option(o, "volume", dir + "/out:/out")
+    same_int(lib::container_run(s, o), 0, "ran")
+    same(util::read_trim(dir + "/out/stamp"), "built-in-run", "the RUN layer is part of the image")
+    util::rm_rf(dir)
+end
