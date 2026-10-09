@@ -1,0 +1,60 @@
+mod util
+
+fn sha_cmd() -> string is
+    if util::tool_exists("sha256sum") is return "sha256sum" end
+    return "shasum -a 256"
+end
+
+pub fn valid(d: string) -> bool is
+    if !string_starts_with(d, "sha256:") is return false end
+    let h: string = string_slice(d, 7, string_len(d))
+    return string_len(h) == 64 && util::is_hex(h)
+end
+
+;; "sha256:abc…" -> "abc…"   (anything without a colon is returned unchanged)
+pub fn hex_of(d: string) -> string is
+    let i: int = string_find(d, ":")
+    if i < 0 is return d end
+    return string_slice(d, i + 1, string_len(d))
+end
+
+pub fn tag(hex: string) -> string is
+    if hex == "" is return "" end
+    return "sha256:" + hex
+end
+
+pub fn of_file(path: string) -> string is
+    if !util::exists(path) is return "" end
+    let h: string = util::capture(sha_cmd() + " " + util::sq(path) + " 2>/dev/null | cut -d' ' -f1")
+    if string_len(h) != 64 is return "" end
+    return tag(h)
+end
+
+;; Digest of the output of a shell pipeline, e.g. `gzip -dc layer.tar.gz`.
+pub fn of_command(cmd: string) -> string is
+    let h: string = util::capture("( " + cmd + " ) 2>/dev/null | " + sha_cmd() + " | cut -d' ' -f1")
+    if string_len(h) != 64 is return "" end
+    return tag(h)
+end
+
+pub fn of_string(s: string) -> string is
+    if string_len(s) < 60000 is
+        return of_command("printf '%s' " + util::sq(s))
+    end
+    let tmp: string = util::capture("mktemp")
+    util::write_file(tmp, s)
+    let d: string = of_file(tmp)
+    util::quiet("rm -f " + util::sq(tmp))
+    return d
+end
+
+pub fn verify_file(expected: string, path: string) -> bool is
+    if !valid(expected) is return false end
+    return of_file(path) == expected
+end
+
+;; OCI chain id: chain(0) = diff_id(0); chain(n) = sha256(chain(n-1) + " " + diff_id(n)).
+pub fn chain_id(parent_chain: string, diff_id: string) -> string is
+    if parent_chain == "" is return diff_id end
+    return of_string(parent_chain + " " + diff_id)
+end
