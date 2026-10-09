@@ -1,0 +1,330 @@
+extern static [c] is
+    fn system(cmd: string) -> int
+end
+
+;; BEGIN-PRIMITIVES
+pub fn p_system(cmd: string) -> int is return system(cmd) end
+pub fn p_read(path: string) -> string is return file_read(path) end
+pub fn p_write(path: string, data: string) is file_write(path, data) end
+pub fn p_file_exists(path: string) -> bool is return file_exists(path) end
+pub fn p_dir_exists(path: string) -> bool is return dir_exists(path) end
+pub fn p_env(name: string) -> string is return env_get(name) end
+pub fn p_setenv(name: string, value: string) is env_set(name, value) end
+pub fn p_pid() -> int is return proc_id() end
+pub fn p_now_ms() -> int is return time_ms() end
+;; END-PRIMITIVES
+
+;; ── Shell ────────────────────────────────────────────────────────────────────
+
+;; POSIX single-quote a value so it is safe inside a shell command line.
+pub fn sq(s: string) -> string is
+    return "'" + string_replace(s, "'", "'\\''") + "'"
+end
+
+;; Exit code of a command line (stdin/stdout/stderr are inherited).
+pub fn run(cmd: string) -> int is
+    let rc: int = p_system(cmd)
+    if rc > 255 is return rc / 256 end
+    return rc
+end
+
+pub fn ok(cmd: string) -> bool is
+    return run(cmd) == 0
+end
+
+;; stdout+stderr of a command, trimmed.
+pub fn capture(cmd: string) -> string is
+    return string_trim(shell(cmd))
+end
+
+;; Runs the command with all output discarded; returns its exit code.
+pub fn quiet(cmd: string) -> int is
+    return run("( " + cmd + " ) >/dev/null 2>&1")
+end
+
+pub fn tool_exists(name: string) -> bool is
+    return quiet("command -v " + sq(name)) == 0
+end
+
+pub fn first_tool(names: [string]) -> string is
+    let mut i: int = 0
+    while i < array_len(names) is
+        if tool_exists(names[i]) is return names[i] end
+        i += 1
+    end
+    return ""
+end
+
+;; ── Numbers ──────────────────────────────────────────────────────────────────
+
+pub fn digit_of(c: string) -> int is
+    let digits: string = "0123456789"
+    if string_len(c) != 1 is return 0 - 1 end
+    return string_find(digits, c)
+end
+
+;; Parses an optionally signed decimal integer; anything unparsable stops the parse.
+pub fn atoi(s_in: string) -> int is
+    let s: string = string_trim(s_in)
+    let n: int = string_len(s)
+    if n == 0 is return 0 end
+    let mut i: int = 0
+    let mut neg: bool = false
+    if string_at(s, 0) == "-" is
+        neg = true
+        i = 1
+    end
+    let mut v: int = 0
+    while i < n is
+        let d: int = digit_of(string_at(s, i))
+        if d < 0 is
+            if neg is return 0 - v end
+            return v
+        end
+        v = v * 10 + d
+        i += 1
+    end
+    if neg is return 0 - v end
+    return v
+end
+
+pub fn is_number(s: string) -> bool is
+    if string_len(s) == 0 is return false end
+    let mut i: int = 0
+    while i < string_len(s) is
+        if digit_of(string_at(s, i)) < 0 is return false end
+        i += 1
+    end
+    return true
+end
+
+pub fn is_hex(s: string) -> bool is
+    if string_len(s) == 0 is return false end
+    let hex: string = "0123456789abcdef"
+    let mut i: int = 0
+    while i < string_len(s) is
+        if string_find(hex, string_at(s, i)) < 0 is return false end
+        i += 1
+    end
+    return true
+end
+
+;; "512m", "2g", "100k", "1024" -> bytes.  Unknown / empty -> 0 (= unlimited).
+pub fn parse_size(s_in: string) -> int is
+    let s: string = string_lower(string_trim(s_in))
+    if s == "" is return 0 end
+    let last: string = string_at(s, string_len(s) - 1)
+    let mut mult: int = 1
+    let mut num: string = s
+    if last == "k" is
+        mult = 1024
+        num = string_slice(s, 0, string_len(s) - 1)
+    else if last == "m" is
+        mult = 1048576
+        num = string_slice(s, 0, string_len(s) - 1)
+    else if last == "g" is
+        mult = 1073741824
+        num = string_slice(s, 0, string_len(s) - 1)
+    else if last == "b" is
+        num = string_slice(s, 0, string_len(s) - 1)
+    end
+    if !is_number(num) is return 0 end
+    return atoi(num) * mult
+end
+
+;; ── Strings and arrays ──────────────────────────────────────────────────────
+
+pub fn or_default(v: string, fallback: string) -> string is
+    if v != "" is return v end
+    return fallback
+end
+
+pub fn join(items: [string], sep: string) -> string is
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < array_len(items) is
+        if i > 0 is out = out + sep end
+        out = out + items[i]
+        i += 1
+    end
+    return out
+end
+
+pub fn has(items: [string], needle: string) -> bool is
+    let mut i: int = 0
+    while i < array_len(items) is
+        if items[i] == needle is return true end
+        i += 1
+    end
+    return false
+end
+
+pub fn without(items: [string], needle: string) -> [string] is
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < array_len(items) is
+        if items[i] != needle is out = array_push(out, items[i]) end
+        i += 1
+    end
+    return out
+end
+
+;; Non-empty trimmed lines of a text.
+pub fn lines(text: string) -> [string] is
+    let parts: [string] = string_split(text, "\n")
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < array_len(parts) is
+        let t: string = string_trim(parts[i])
+        if t != "" is out = array_push(out, t) end
+        i += 1
+    end
+    return out
+end
+
+pub fn csv(s: string) -> [string] is
+    let parts: [string] = string_split(s, ",")
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < array_len(parts) is
+        let t: string = string_trim(parts[i])
+        if t != "" is out = array_push(out, t) end
+        i += 1
+    end
+    return out
+end
+
+pub fn tail_after(s: string, sep: string) -> string is
+    let i: int = string_find(s, sep)
+    if i < 0 is return "" end
+    return string_slice(s, i + string_len(sep), string_len(s))
+end
+
+pub fn head_before(s: string, sep: string) -> string is
+    let i: int = string_find(s, sep)
+    if i < 0 is return s end
+    return string_slice(s, 0, i)
+end
+
+;; Index of the last occurrence of the one-character string `c`, or -1.
+pub fn last_index(s: string, c: string) -> int is
+    let mut i: int = string_len(s) - 1
+    while i >= 0 is
+        if string_at(s, i) == c is return i end
+        i -= 1
+    end
+    return 0 - 1
+end
+
+pub fn basename(path: string) -> string is
+    let mut p: string = path
+    while string_len(p) > 1 && string_ends_with(p, "/") is
+        p = string_slice(p, 0, string_len(p) - 1)
+    end
+    let i: int = last_index(p, "/")
+    if i < 0 is return p end
+    return string_slice(p, i + 1, string_len(p))
+end
+
+pub fn dirname(path: string) -> string is
+    let i: int = last_index(path, "/")
+    if i < 0 is return "." end
+    if i == 0 is return "/" end
+    return string_slice(path, 0, i)
+end
+
+;; ── Files ───────────────────────────────────────────────────────────────────
+
+pub fn mkdir_p(path: string) is
+    quiet("mkdir -p " + sq(path))
+end
+
+;; Refuses to remove anything that is obviously not a library-owned directory.
+pub fn rm_rf(path: string) -> bool is
+    if string_len(path) < 6 || path == "/usr" || path == "/etc" || path == "/home" || path == "/root" is return false end
+    if string_contains(path, "..") is return false end
+    return quiet("rm -rf " + sq(path)) == 0
+end
+
+pub fn exists(path: string) -> bool is
+    return quiet("test -e " + sq(path) + " -o -L " + sq(path)) == 0
+end
+
+pub fn is_dir(path: string) -> bool is
+    return p_dir_exists(path)
+end
+
+pub fn is_file(path: string) -> bool is
+    return p_file_exists(path)
+end
+
+pub fn read(path: string) -> string is
+    if !p_file_exists(path) is return "" end
+    return p_read(path)
+end
+
+pub fn write_file(path: string, data: string) is
+    mkdir_p(dirname(path))
+    p_write(path, data)
+end
+
+pub fn append_line(path: string, line: string) is
+    quiet("printf '%s\\n' " + sq(line) + " >> " + sq(path))
+end
+
+pub fn read_trim(path: string) -> string is
+    return string_trim(read(path))
+end
+
+pub fn file_size(path: string) -> int is
+    return atoi(capture("stat -c %s " + sq(path) + " 2>/dev/null"))
+end
+
+pub fn dir_size(path: string) -> int is
+    return atoi(capture("du -sb " + sq(path) + " 2>/dev/null | cut -f1"))
+end
+
+;; ── Time, identity, randomness ──────────────────────────────────────────────
+
+pub fn now_iso() -> string is
+    return capture("date -u +%Y-%m-%dT%H:%M:%SZ")
+end
+
+pub fn now_ms() -> int is
+    return p_now_ms()
+end
+
+pub fn rand_hex(nbytes: int) -> string is
+    let cmd: string = "head -c " + to_string(nbytes) + " /dev/urandom | od -An -tx1 | tr -d ' \\n'"
+    return capture(cmd)
+end
+
+pub fn pid() -> int is
+    return p_pid()
+end
+
+pub fn arch() -> string is
+    let m: string = capture("uname -m")
+    if m == "x86_64" || m == "amd64" is return "amd64" end
+    if m == "aarch64" || m == "arm64" is return "arm64" end
+    if m == "armv7l" || m == "armv6l" is return "arm" end
+    if m == "riscv64" is return "riscv64" end
+    if m == "ppc64le" is return "ppc64le" end
+    if m == "s390x" is return "s390x" end
+    if m == "i686" || m == "i386" is return "386" end
+    return m
+end
+
+pub fn is_root() -> bool is
+    return capture("id -u") == "0"
+end
+
+;; Prints a diagnostic line on stderr.
+pub fn eprint(msg: string) is
+    run("printf '%s\\n' " + sq(msg) + " >&2")
+end
+
+;; Like quiet(), but lets stderr through.
+pub fn run_err(cmd: string) -> int is
+    return run("( " + cmd + " ) >/dev/null")
+end
