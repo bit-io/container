@@ -1,0 +1,534 @@
+mod util
+mod jx
+mod digest
+mod reference
+mod store
+mod image
+mod spec
+mod cgroup
+mod network
+mod runtime
+mod registry
+
+pub struct BuildState is
+    pub bs_cfg:       image::ImageConfig
+    pub bs_work:      string
+    pub bs_tmp:       string
+    pub bs_ctx:       string
+    pub bs_net:       string
+    pub bs_args:      [string]     ;; ARG name=value
+    pub bs_digests:   [string]     ;; layer blobs (base layers first)
+    pub bs_sizes:     [int]
+    pub bs_types:     [string]
+    pub bs_layers:    int          ;; number of layers we created
+    pub bs_user:      string
+    pub bs_ok:        bool
+    pub bs_error:     string
+end
+
+;; ── Parsing ──────────────────────────────────────────────────────────────────
+
+;; Logical lines: comments dropped, trailing-backslash continuations joined.
+pub fn logical_lines(text: string) -> [string] is
+    let raw: [string] = string_split(text, "\n")
+    let mut out: [string] = []
+    let mut cur: string = ""
+    let mut i: int = 0
+    while i < array_len(raw) is
+        let line: string = string_trim(raw[i])
+        if cur == "" && (line == "" || string_starts_with(line, "#")) is
+            i += 1
+        else is
+            if string_ends_with(line, "\\") is
+                cur = cur + string_trim(string_slice(line, 0, string_len(line) - 1)) + " "
+            else is
+                out = array_push(out, string_trim(cur + line))
+                cur = ""
+            end
+            i += 1
+        end
+    end
+    if string_trim(cur) != "" is out = array_push(out, string_trim(cur)) end
+    return out
+end
+
+pub fn instruction_of(line: string) -> string is
+    return string_upper(util::head_before(line, " "))
+end
+
+pub fn arguments_of(line: string) -> string is
+    return string_trim(util::tail_after(line, " "))
+end
+
+;; `["a","b"]` -> items; anything else is the shell form: /bin/sh -c "<text>".
+pub fn exec_or_shell(rest: string) -> [string] is
+    let t: string = string_trim(rest)
+    if string_starts_with(t, "[") && jx::looks_valid(t) is return jx::str_items(t) end
+    return ["/bin/sh", "-c", t]
+end
+
+fn is_name_char(c: string) -> bool is
+    let set: string = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
+    return string_len(c) == 1 && string_find(set, c) >= 0
+end
+
+fn lookup(vars: [string], name: string) -> string is
+    let mut i: int = array_len(vars) - 1
+    while i >= 0 is
+        if util::head_before(vars[i], "=") == name is return util::tail_after(vars[i], "=") end
+        i -= 1
+    end
+    return ""
+end
+
+;; $NAME and ${NAME} expansion (unknown names become empty).
+pub fn substitute(text: string, vars: [string]) -> string is
+    let n: int = string_len(text)
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < n is
+        let c: string = string_at(text, i)
+        if c == "\\" && i + 1 < n && string_at(text, i + 1) == "$" is
+            out = out + "$"
+            i += 2
+        else if c == "$" && i + 1 < n is
+            let nx: string = string_at(text, i + 1)
+            if nx == "{" is
+                let close: int = string_find(string_slice(text, i + 2, n), "}")
+                if close >= 0 is
+                    out = out + lookup(vars, string_slice(text, i + 2, i + 2 + close))
+                    i = i + 3 + close
+                else is
+                    out = out + c
+                    i += 1
+                end
+            else if is_name_char(nx) is
+                let mut j: int = i + 1
+                while j < n && is_name_char(string_at(text, j)) is j += 1 end
+                out = out + lookup(vars, string_slice(text, i + 1, j))
+                i = j
+            else is
+                out = out + c
+                i += 1
+            end
+        else is
+            out = out + c
+            i += 1
+        end
+    end
+    return out
+end
+
+;; KEY=value KEY2="two words" ...  or the legacy `KEY value` form.
+pub fn key_values(rest: string) -> [string] is
+    let t: string = string_trim(rest)
+    let first_eq: int = string_find(t, "=")
+    let first_sp: int = string_find(t, " ")
+    if first_eq < 0 || (first_sp >= 0 && first_sp < first_eq) is
+        return [util::head_before(t, " ") + "=" + string_trim(util::tail_after(t, " "))]
+    end
+    let mut out: [string] = []
+    let n: int = string_len(t)
+    let mut i: int = 0
+    while i < n is
+        while i < n && string_at(t, i) == " " is i += 1 end
+        let mut tok: string = ""
+        let mut quote: string = ""
+        while i < n && (quote != "" || string_at(t, i) != " ") is
+            let c: string = string_at(t, i)
+            if quote == "" && (c == "\"" || c == "'") is
+                quote = c
+            else if quote != "" && c == quote is
+                quote = ""
+            else if c == "\\" && i + 1 < n is
+                tok = tok + string_at(t, i + 1)
+                i += 1
+            else is
+                tok = tok + c
+            end
+            i += 1
+        end
+        if tok != "" is out = array_push(out, tok) end
+    end
+    return out
+end
+
+;; ── Snapshots and layers ─────────────────────────────────────────────────────
+
+fn snapshot(work: string, out: string) is
+    util::quiet("cd " + util::sq(work) + " && find . -mindepth 1 -printf '%p\\t%y\\t%s\\t%T@\\t%m\\t%U:%G\\t%l\\n' | LC_ALL=C sort > " + util::sq(out))
+end
+
+;; Turns the difference between two snapshots into a layer. Returns false when nothing changed.
+fn commit_layer(s: store::Store, st: BuildState, before: string, after: string, created_by: string) -> BuildState is
+    let t: string = st.bs_tmp
+    util::quiet("LC_ALL=C comm -13 " + util::sq(before) + " " + util::sq(after) + " | cut -f1 > " + util::sq(t + "/changed.lst"))
+    util::quiet("cut -f1 " + util::sq(before) + " | LC_ALL=C sort > " + util::sq(t + "/b.p"))
+    util::quiet("cut -f1 " + util::sq(after) + " | LC_ALL=C sort > " + util::sq(t + "/a.p"))
+    util::quiet("LC_ALL=C comm -23 " + util::sq(t + "/b.p") + " " + util::sq(t + "/a.p") + " > " + util::sq(t + "/deleted.lst"))
+    let changed: [string] = util::lines(util::read(t + "/changed.lst"))
+    let deleted: [string] = util::lines(util::read(t + "/deleted.lst"))
+    let mut out: BuildState = st
+    if array_len(changed) == 0 && array_len(deleted) == 0 is
+        let mut cfg_tmp1: image::ImageConfig = out.bs_cfg
+        cfg_tmp1.ic_history = array_push(st.bs_cfg.ic_history, created_by)
+        out.bs_cfg = cfg_tmp1
+        return out
+    end
+    util::rm_rf(t + "/wh")
+    util::mkdir_p(t + "/wh")
+    let mut last: string = ""
+    let mut i: int = 0
+    while i < array_len(deleted) is
+        let p: string = deleted[i]
+        if last == "" || !string_starts_with(p, last + "/") is
+            let dn: string = util::dirname(p)
+            util::mkdir_p(t + "/wh/" + dn)
+            util::write_file(t + "/wh/" + dn + "/.wh." + util::basename(p), "")
+            last = p
+        end
+        i += 1
+    end
+    let tar: string = t + "/layer-" + to_string(st.bs_layers) + ".tar"
+    util::quiet("rm -f " + util::sq(tar))
+    if array_len(changed) > 0 is
+        util::quiet("tar -cf " + util::sq(tar) + " --no-recursion -C " + util::sq(st.bs_work) + " -T " + util::sq(t + "/changed.lst"))
+    else is
+        util::quiet("tar -cf " + util::sq(tar) + " -T /dev/null")
+    end
+    if array_len(deleted) > 0 is util::quiet("tar -rf " + util::sq(tar) + " -C " + util::sq(t + "/wh") + " .") end
+    let diff: string = digest::of_file(tar)
+    let gz: string = tar + ".gz"
+    util::quiet("gzip -n -c " + util::sq(tar) + " > " + util::sq(gz))
+    let blob: string = image::put_blob(s, gz)
+    if blob == "" || diff == "" is
+        out.bs_ok = false
+        out.bs_error = "could not write the layer for: " + created_by
+        return out
+    end
+    out.bs_digests = array_push(st.bs_digests, blob)
+    out.bs_sizes = array_push(st.bs_sizes, util::file_size(gz))
+    out.bs_types = array_push(st.bs_types, "application/vnd.oci.image.layer.v1.tar+gzip")
+    let mut cfg_tmp2: image::ImageConfig = out.bs_cfg
+    cfg_tmp2.ic_diff_ids = array_push(st.bs_cfg.ic_diff_ids, diff)
+    out.bs_cfg = cfg_tmp2
+    let mut cfg_tmp3: image::ImageConfig = out.bs_cfg
+    cfg_tmp3.ic_history = array_push(st.bs_cfg.ic_history, created_by)
+    out.bs_cfg = cfg_tmp3
+    out.bs_layers = st.bs_layers + 1
+    util::quiet("rm -f " + util::sq(tar) + " " + util::sq(gz))
+    return out
+end
+
+fn fail(st: BuildState, why: string) -> BuildState is
+    let mut out: BuildState = st
+    out.bs_ok = false
+    out.bs_error = why
+    return out
+end
+
+;; ── Instructions ─────────────────────────────────────────────────────────────
+
+fn abs_path(st: BuildState, p: string) -> string is
+    if string_starts_with(p, "/") is return p end
+    let wd: string = util::or_default(st.bs_cfg.ic_workdir, "/")
+    if wd == "/" is return "/" + p end
+    return wd + "/" + p
+end
+
+fn safe_glob(p: string) -> bool is
+    let ok: string = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-/*?[]+@%"
+    if p == "" || string_contains(p, "..") is return false end
+    let mut i: int = 0
+    while i < string_len(p) is
+        if string_find(ok, string_at(p, i)) < 0 is return false end
+        i += 1
+    end
+    return true
+end
+
+fn is_archive(name: string) -> bool is
+    return string_ends_with(name, ".tar") || string_ends_with(name, ".tar.gz") || string_ends_with(name, ".tgz") || string_ends_with(name, ".tar.xz") || string_ends_with(name, ".tar.bz2")
+end
+
+;; COPY / ADD: copies from the build context into the working root.
+fn do_copy(st: BuildState, rest: string, extract: bool) -> BuildState is
+    let mut chown: string = ""
+    let mut words: [string] = []
+    let parts: [string] = util::lines(string_replace(rest, " ", "\n"))
+    let mut i: int = 0
+    while i < array_len(parts) is
+        if string_starts_with(parts[i], "--chown=") is
+            chown = string_slice(parts[i], 8, string_len(parts[i]))
+        else if string_starts_with(parts[i], "--from") is
+            return fail(st, "COPY --from (multi-stage builds) is not supported")
+        else if string_starts_with(parts[i], "--chmod") || string_starts_with(parts[i], "--link") is
+            i += 0
+        else is
+            words = array_push(words, parts[i])
+        end
+        i += 1
+    end
+    if array_len(words) < 2 is return fail(st, "COPY needs at least one source and a destination") end
+    let dest_in: string = words[array_len(words) - 1]
+    let dest: string = abs_path(st, dest_in)
+    let dir_dest: bool = string_ends_with(dest_in, "/") || array_len(words) > 2
+    let target: string = st.bs_work + dest
+    let multi: bool = array_len(words) > 2
+    let mut k: int = 0
+    while k < array_len(words) - 1 is
+        let src: string = words[k]
+        if string_starts_with(src, "http://") || string_starts_with(src, "https://") is return fail(st, "ADD/COPY of URLs is not supported: " + src) end
+        if !safe_glob(src) is return fail(st, "unsupported source pattern: " + src) end
+        let pat: string = if string_starts_with(src, "/") then string_slice(src, 1, string_len(src)) else src
+        let body: string = "cd " + util::sq(st.bs_ctx) + " && n=0 && for f in " + pat + "; do [ -e \"$f\" ] || continue; n=$((n+1)); "
+        let mut cmd: string = body
+        cmd = cmd + "if [ -d \"$f\" ]; then mkdir -p " + util::sq(target) + " && cp -a \"$f\"/. " + util::sq(target) + "/; "
+        if extract is
+            cmd = cmd + "elif " + (if is_archive(src) then "true" else "false") + "; then mkdir -p " + util::sq(target) + " && tar -xf \"$f\" -C " + util::sq(target) + "; "
+        end
+        if dir_dest || multi is
+            cmd = cmd + "else mkdir -p " + util::sq(target) + " && cp -a \"$f\" " + util::sq(target) + "/; fi; done; [ $n -gt 0 ]"
+        else is
+            cmd = cmd + "else mkdir -p " + util::sq(util::dirname(target)) + " && cp -a \"$f\" " + util::sq(target) + "; fi; done; [ $n -gt 0 ]"
+        end
+        if util::quiet(cmd) != 0 is return fail(st, "COPY failed for source '" + src + "' (not found in the build context?)") end
+        k += 1
+    end
+    if chown != "" is
+        let ids: string = spec::resolve_user(st.bs_work, chown)
+        util::quiet("chown -R " + util::sq(ids) + " " + util::sq(target))
+    end
+    return st
+end
+
+fn do_run(s: store::Store, st: BuildState, rest: string) -> BuildState is
+    let mut o: runtime::Options = runtime::options("")
+    o = runtime::opt(o, "rootfs_dir", st.bs_work)
+    o = runtime::opt(o, "network", st.bs_net)
+    o = runtime::opt(o, "rm", "true")
+    o = runtime::opt(o, "workdir", util::or_default(st.bs_cfg.ic_workdir, "/"))
+    if st.bs_user != "" is o = runtime::opt(o, "user", st.bs_user) end
+    let mut i: int = 0
+    while i < array_len(st.bs_cfg.ic_env) is
+        o = runtime::opt_add(o, "env", st.bs_cfg.ic_env[i])
+        i += 1
+    end
+    let mut j: int = 0
+    while j < array_len(st.bs_args) is
+        o = runtime::opt_add(o, "env", st.bs_args[j])
+        j += 1
+    end
+    let argv: [string] = exec_or_shell(rest)
+    let mut a: int = 0
+    while a < array_len(argv) is
+        o = runtime::opt_add(o, "arg", argv[a])
+        a += 1
+    end
+    let rc: int = runtime::run_container(s, o)
+    util::quiet("rm -rf " + util::sq(st.bs_work + "/.po"))
+    if rc != 0 is return fail(st, "RUN failed (exit code " + to_string(rc) + "): " + rest) end
+    return st
+end
+
+fn apply(s: store::Store, st_in: BuildState, line: string) -> BuildState is
+    let instr: string = instruction_of(line)
+    let vars: [string] = array_concat(st_in.bs_cfg.ic_env, st_in.bs_args)
+    let rest: string = substitute(arguments_of(line), vars)
+    let mut st: BuildState = st_in
+    if instr == "ENV" is
+        let mut cfg_tmp4: image::ImageConfig = st.bs_cfg
+        cfg_tmp4.ic_env = runtime::merge_env(st.bs_cfg.ic_env, key_values(rest))
+        st.bs_cfg = cfg_tmp4
+        let mut cfg_tmp5: image::ImageConfig = st.bs_cfg
+        cfg_tmp5.ic_history = array_push(st.bs_cfg.ic_history, "ENV " + rest)
+        st.bs_cfg = cfg_tmp5
+        return st
+    end
+    if instr == "ARG" is
+        let name: string = util::head_before(rest, "=")
+        let has_default: bool = string_contains(rest, "=")
+        if lookup(st.bs_args, name) == "" && has_default is st.bs_args = array_push(st.bs_args, rest) end
+        return st
+    end
+    if instr == "WORKDIR" is
+        let wd: string = abs_path(st, rest)
+        util::mkdir_p(st.bs_work + wd)
+        let mut cfg_tmp6: image::ImageConfig = st.bs_cfg
+        cfg_tmp6.ic_workdir = wd
+        st.bs_cfg = cfg_tmp6
+        let mut cfg_tmp7: image::ImageConfig = st.bs_cfg
+        cfg_tmp7.ic_history = array_push(st.bs_cfg.ic_history, "WORKDIR " + wd)
+        st.bs_cfg = cfg_tmp7
+        return st
+    end
+    if instr == "USER" is
+        st.bs_user = rest
+        let mut cfg_tmp8: image::ImageConfig = st.bs_cfg
+        cfg_tmp8.ic_user = rest
+        st.bs_cfg = cfg_tmp8
+        let mut cfg_tmp9: image::ImageConfig = st.bs_cfg
+        cfg_tmp9.ic_history = array_push(st.bs_cfg.ic_history, "USER " + rest)
+        st.bs_cfg = cfg_tmp9
+        return st
+    end
+    if instr == "LABEL" is
+        let kv: [string] = key_values(rest)
+        let mut cfg_tmp10: image::ImageConfig = st.bs_cfg
+        cfg_tmp10.ic_labels = array_concat(st.bs_cfg.ic_labels, kv)
+        st.bs_cfg = cfg_tmp10
+        let mut cfg_tmp11: image::ImageConfig = st.bs_cfg
+        cfg_tmp11.ic_history = array_push(st.bs_cfg.ic_history, "LABEL " + rest)
+        st.bs_cfg = cfg_tmp11
+        return st
+    end
+    if instr == "EXPOSE" is
+        let ports: [string] = util::lines(string_replace(rest, " ", "\n"))
+        let mut i: int = 0
+        while i < array_len(ports) is
+            let mut cfg_tmp12: image::ImageConfig = st.bs_cfg
+            cfg_tmp12.ic_ports = array_push(st.bs_cfg.ic_ports, if string_contains(ports[i], "/") then ports[i] else ports[i] + "/tcp")
+            st.bs_cfg = cfg_tmp12
+            i += 1
+        end
+        let mut cfg_tmp13: image::ImageConfig = st.bs_cfg
+        cfg_tmp13.ic_history = array_push(st.bs_cfg.ic_history, "EXPOSE " + rest)
+        st.bs_cfg = cfg_tmp13
+        return st
+    end
+    if instr == "VOLUME" is
+        let vols: [string] = if string_starts_with(rest, "[") then jx::str_items(rest) else util::lines(string_replace(rest, " ", "\n"))
+        let mut cfg_tmp14: image::ImageConfig = st.bs_cfg
+        cfg_tmp14.ic_volumes = array_concat(st.bs_cfg.ic_volumes, vols)
+        st.bs_cfg = cfg_tmp14
+        let mut cfg_tmp15: image::ImageConfig = st.bs_cfg
+        cfg_tmp15.ic_history = array_push(st.bs_cfg.ic_history, "VOLUME " + rest)
+        st.bs_cfg = cfg_tmp15
+        return st
+    end
+    if instr == "ENTRYPOINT" is
+        let mut cfg_tmp16: image::ImageConfig = st.bs_cfg
+        cfg_tmp16.ic_entrypoint = exec_or_shell(rest)
+        st.bs_cfg = cfg_tmp16
+        let mut cfg_tmp17: image::ImageConfig = st.bs_cfg
+        cfg_tmp17.ic_cmd = []
+        st.bs_cfg = cfg_tmp17
+        let mut cfg_tmp18: image::ImageConfig = st.bs_cfg
+        cfg_tmp18.ic_history = array_push(st.bs_cfg.ic_history, "ENTRYPOINT " + rest)
+        st.bs_cfg = cfg_tmp18
+        return st
+    end
+    if instr == "CMD" is
+        let mut cfg_tmp19: image::ImageConfig = st.bs_cfg
+        cfg_tmp19.ic_cmd = exec_or_shell(rest)
+        st.bs_cfg = cfg_tmp19
+        let mut cfg_tmp20: image::ImageConfig = st.bs_cfg
+        cfg_tmp20.ic_history = array_push(st.bs_cfg.ic_history, "CMD " + rest)
+        st.bs_cfg = cfg_tmp20
+        return st
+    end
+    if instr == "STOPSIGNAL" is
+        let mut cfg_tmp21: image::ImageConfig = st.bs_cfg
+        cfg_tmp21.ic_stopsignal = rest
+        st.bs_cfg = cfg_tmp21
+        return st
+    end
+    if instr == "MAINTAINER" || instr == "SHELL" || instr == "HEALTHCHECK" || instr == "ONBUILD" is return st end
+    if instr == "FROM" is return fail(st, "multi-stage builds are not supported (second FROM)") end
+    if instr == "COPY" || instr == "ADD" || instr == "RUN" is
+        let before: string = st.bs_tmp + "/before.txt"
+        let after: string = st.bs_tmp + "/after.txt"
+        snapshot(st.bs_work, before)
+        let mut r: BuildState = st
+        if instr == "RUN" is r = do_run(s, st, rest) else is r = do_copy(st, rest, instr == "ADD") end
+        if !r.bs_ok is return r end
+        snapshot(r.bs_work, after)
+        return commit_layer(s, r, before, after, instr + " " + rest)
+    end
+    return fail(st, "unknown instruction: " + instr)
+end
+
+;; ── Entry point ──────────────────────────────────────────────────────────────
+
+fn empty_state(s: store::Store, ctx: string, net: string, build_args: [string]) -> BuildState is
+    let tmp: string = store::scratch(s, "build")
+    return BuildState { bs_cfg: image::new_config(), bs_work: tmp + "/rootfs", bs_tmp: tmp, bs_ctx: ctx, bs_net: net, bs_args: build_args, bs_digests: [], bs_sizes: [], bs_types: [], bs_layers: 0, bs_user: "", bs_ok: true, bs_error: "" }
+end
+
+;; Builds an image from `containerfile` (path; default <context>/Containerfile or Dockerfile).
+;; `build_args` are "NAME=value" entries, `net` is the network mode for RUN steps.
+;; Returns the new image id, or "" (the reason is printed on stderr).
+pub fn build_image(s: store::Store, context_dir: string, containerfile: string, tag: string, build_args: [string], net: string) -> string is
+    let mut file: string = containerfile
+    if file == "" is
+        if util::is_file(context_dir + "/Containerfile") is
+            file = context_dir + "/Containerfile"
+        else is
+            file = context_dir + "/Dockerfile"
+        end
+    end
+    if !util::is_file(file) is
+        util::eprint("build: no Containerfile at " + file)
+        return ""
+    end
+    let r: reference::Reference = reference::parse(tag)
+    if tag != "" && !r.rf_ok is
+        util::eprint("build: " + r.rf_error)
+        return ""
+    end
+    let lines: [string] = logical_lines(util::read(file))
+    if array_len(lines) == 0 || instruction_of(lines[0]) != "FROM" is
+        util::eprint("build: the first instruction must be FROM")
+        return ""
+    end
+    let mut st: BuildState = empty_state(s, context_dir, util::or_default(net, "host"), build_args)
+    util::mkdir_p(st.bs_work)
+    let from_args: string = substitute(arguments_of(lines[0]), build_args)
+    let base_name: string = util::head_before(from_args, " ")
+    if base_name != "scratch" is
+        let mut base_id: string = image::resolve(s, base_name)
+        if base_id == "" is base_id = registry::pull(s, base_name) end
+        if base_id == "" is
+            util::eprint("build: cannot find or pull the base image " + base_name)
+            util::rm_rf(st.bs_tmp)
+            return ""
+        end
+        let manifest: string = util::read(s.st_root + "/images/" + base_id + "/manifest.json")
+        let layers: [string] = jx::items(jx::field(manifest, "layers"))
+        let mut i: int = 0
+        while i < array_len(layers) is
+            let d: string = jx::field_str(layers[i], "digest")
+            if !image::unpack_into(store::blob_path(s, d), st.bs_work) is
+                util::eprint("build: cannot unpack the base image")
+                util::rm_rf(st.bs_tmp)
+                return ""
+            end
+            st.bs_digests = array_push(st.bs_digests, d)
+            st.bs_sizes = array_push(st.bs_sizes, jx::field_int(layers[i], "size", 0))
+            st.bs_types = array_push(st.bs_types, util::or_default(jx::field_str(layers[i], "mediaType"), "application/vnd.oci.image.layer.v1.tar+gzip"))
+            i += 1
+        end
+        st.bs_cfg = image::config_of(s, base_id)
+        st.bs_user = st.bs_cfg.ic_user
+    end
+    let mut n: int = 1
+    while n < array_len(lines) && st.bs_ok is
+        st = apply(s, st, lines[n])
+        n += 1
+    end
+    if !st.bs_ok is
+        util::eprint("build: " + st.bs_error)
+        util::rm_rf(st.bs_tmp)
+        return ""
+    end
+    let mut cfg_tmp22: image::ImageConfig = st.bs_cfg
+    cfg_tmp22.ic_created = util::now_iso()
+    st.bs_cfg = cfg_tmp22
+    let cfg_text: string = image::config_to_json(st.bs_cfg)
+    let cfg_digest: string = image::put_text_blob(s, cfg_text)
+    let manifest_out: string = image::build_manifest(cfg_digest, string_len(cfg_text), st.bs_digests, st.bs_sizes, st.bs_types)
+    let names: [string] = if tag == "" then [] else [reference::canonical(r)]
+    let id: string = image::install(s, manifest_out, names)
+    util::rm_rf(st.bs_tmp)
+    return id
+end
