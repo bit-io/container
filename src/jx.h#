@@ -1,0 +1,289 @@
+mod util
+
+;; ── Writing ──────────────────────────────────────────────────────────────────
+
+pub fn esc(s: string) -> string is
+    let a: string = string_replace(s, "\\", "\\\\")
+    let b: string = string_replace(a, "\"", "\\\"")
+    let c: string = string_replace(b, "\n", "\\n")
+    let d: string = string_replace(c, "\r", "\\r")
+    return string_replace(d, "\t", "\\t")
+end
+
+;; A JSON string literal.
+pub fn q(s: string) -> string is
+    return "\"" + esc(s) + "\""
+end
+
+;; `"key":<raw>`
+pub fn kv(key: string, raw: string) -> string is
+    return q(key) + ":" + raw
+end
+
+pub fn obj(parts: [string]) -> string is
+    return "{" + util::join(parts, ",") + "}"
+end
+
+;; `[<raw>,<raw>]` from already-encoded elements.
+pub fn arr(parts: [string]) -> string is
+    return "[" + util::join(parts, ",") + "]"
+end
+
+;; `["a","b"]` from plain strings.
+pub fn str_arr(items: [string]) -> string is
+    let mut parts: [string] = []
+    let mut i: int = 0
+    while i < array_len(items) is
+        parts = array_push(parts, q(items[i]))
+        i += 1
+    end
+    return arr(parts)
+end
+
+;; ── Scanning ─────────────────────────────────────────────────────────────────
+
+fn is_ws(c: string) -> bool is
+    return c == " " || c == "\n" || c == "\t" || c == "\r"
+end
+
+fn skip_ws(s: string, from: int) -> int is
+    let n: int = string_len(s)
+    let mut i: int = from
+    while i < n && is_ws(string_at(s, i)) is
+        i += 1
+    end
+    return i
+end
+
+;; `s[from]` is the opening quote; returns the index just after the closing quote.
+fn str_end(s: string, from: int) -> int is
+    let n: int = string_len(s)
+    let mut i: int = from + 1
+    while i < n is
+        let c: string = string_at(s, i)
+        if c == "\\" is
+            i += 2
+        else if c == "\"" is
+            return i + 1
+        else is
+            i += 1
+        end
+    end
+    return n
+end
+
+;; `s[from]` starts a value; returns the index just after it.
+fn value_end(s: string, from: int) -> int is
+    let n: int = string_len(s)
+    if from >= n is return n end
+    let c: string = string_at(s, from)
+    if c == "\"" is return str_end(s, from) end
+    if c == "{" || c == "[" is
+        let mut depth: int = 0
+        let mut i: int = from
+        while i < n is
+            let d: string = string_at(s, i)
+            if d == "\"" is
+                i = str_end(s, i)
+            else is
+                if d == "{" || d == "[" is depth += 1 end
+                if d == "}" || d == "]" is depth -= 1 end
+                i += 1
+                if depth == 0 is return i end
+            end
+        end
+        return n
+    end
+    let mut j: int = from
+    while j < n is
+        let e: string = string_at(s, j)
+        if e == "," || e == "}" || e == "]" || is_ws(e) is return j end
+        j += 1
+    end
+    return n
+end
+
+;; ── Decoding ─────────────────────────────────────────────────────────────────
+
+fn hex_val(c: string) -> int is
+    let hex: string = "0123456789abcdef"
+    return string_find(hex, string_lower(c))
+end
+
+;; `\u00XX` -> the character (printable ASCII only; anything else is kept verbatim).
+fn ascii_of(code: int) -> string is
+    let table: string = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz" + "{|" + "}~"
+    return string_at(table, code - 32)
+end
+
+;; Unquotes a JSON string literal; anything that is not a string is returned as is.
+pub fn decode_str(raw: string) -> string is
+    let n: int = string_len(raw)
+    if n < 2 || string_at(raw, 0) != "\"" is return raw end
+    let mut out: string = ""
+    let mut i: int = 1
+    let stop: int = n - 1
+    while i < stop is
+        let c: string = string_at(raw, i)
+        if c == "\\" && i + 1 < stop is
+            let d: string = string_at(raw, i + 1)
+            if d == "n" is
+                out = out + "\n"
+                i += 2
+            else if d == "t" is
+                out = out + "\t"
+                i += 2
+            else if d == "r" is
+                out = out + "\r"
+                i += 2
+            else if d == "b" || d == "f" is
+                i += 2
+            else if d == "u" && i + 5 < n is
+                let code: int = hex_val(string_at(raw, i + 2)) * 4096 + hex_val(string_at(raw, i + 3)) * 256 + hex_val(string_at(raw, i + 4)) * 16 + hex_val(string_at(raw, i + 5))
+                if code >= 32 && code < 127 is
+                    out = out + ascii_of(code)
+                else is
+                    out = out + string_slice(raw, i, i + 6)
+                end
+                i += 6
+            else is
+                out = out + d
+                i += 2
+            end
+        else is
+            out = out + c
+            i += 1
+        end
+    end
+    return out
+end
+
+;; ── Reading ──────────────────────────────────────────────────────────────────
+
+;; Raw JSON text of `obj[key]`, or "" when the key is missing.
+pub fn field(obj_text: string, key: string) -> string is
+    let n: int = string_len(obj_text)
+    let mut i: int = skip_ws(obj_text, 0)
+    if i >= n || string_at(obj_text, i) != "{" is return "" end
+    i = skip_ws(obj_text, i + 1)
+    while i < n is
+        let c: string = string_at(obj_text, i)
+        if c == "}" is return "" end
+        if c != "\"" is return "" end
+        let kend: int = str_end(obj_text, i)
+        let k: string = decode_str(string_slice(obj_text, i, kend))
+        i = skip_ws(obj_text, kend)
+        if i >= n || string_at(obj_text, i) != ":" is return "" end
+        i = skip_ws(obj_text, i + 1)
+        let vend: int = value_end(obj_text, i)
+        if k == key is return string_slice(obj_text, i, vend) end
+        i = skip_ws(obj_text, vend)
+        if i < n && string_at(obj_text, i) == "," is
+            i = skip_ws(obj_text, i + 1)
+        end
+    end
+    return ""
+end
+
+pub fn has_key(obj_text: string, key: string) -> bool is
+    return field(obj_text, key) != ""
+end
+
+;; Unquoted string value ("" when missing, `null` or not a string).
+pub fn field_str(obj_text: string, key: string) -> string is
+    let raw: string = field(obj_text, key)
+    if raw == "" || string_at(raw, 0) != "\"" is return "" end
+    return decode_str(raw)
+end
+
+pub fn field_int(obj_text: string, key: string, fallback: int) -> int is
+    let raw: string = field(obj_text, key)
+    if raw == "" || raw == "null" is return fallback end
+    return util::atoi(raw)
+end
+
+pub fn field_bool(obj_text: string, key: string, fallback: bool) -> bool is
+    let raw: string = field(obj_text, key)
+    if raw == "true" is return true end
+    if raw == "false" is return false end
+    return fallback
+end
+
+;; Raw text of every element of a JSON array.
+pub fn items(arr_text: string) -> [string] is
+    let mut out: [string] = []
+    let n: int = string_len(arr_text)
+    let mut i: int = skip_ws(arr_text, 0)
+    if i >= n || string_at(arr_text, i) != "[" is return out end
+    i = skip_ws(arr_text, i + 1)
+    while i < n is
+        let c: string = string_at(arr_text, i)
+        if c == "]" is return out end
+        let vend: int = value_end(arr_text, i)
+        out = array_push(out, string_slice(arr_text, i, vend))
+        i = skip_ws(arr_text, vend)
+        if i < n && string_at(arr_text, i) == "," is
+            i = skip_ws(arr_text, i + 1)
+        end
+    end
+    return out
+end
+
+;; Elements of a JSON array of strings, unquoted.
+pub fn str_items(arr_text: string) -> [string] is
+    let raw: [string] = items(arr_text)
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < array_len(raw) is
+        out = array_push(out, decode_str(raw[i]))
+        i += 1
+    end
+    return out
+end
+
+;; Keys of an object, in document order.
+pub fn keys(obj_text: string) -> [string] is
+    let mut out: [string] = []
+    let n: int = string_len(obj_text)
+    let mut i: int = skip_ws(obj_text, 0)
+    if i >= n || string_at(obj_text, i) != "{" is return out end
+    i = skip_ws(obj_text, i + 1)
+    while i < n is
+        let c: string = string_at(obj_text, i)
+        if c != "\"" is return out end
+        let kend: int = str_end(obj_text, i)
+        out = array_push(out, decode_str(string_slice(obj_text, i, kend)))
+        i = skip_ws(obj_text, kend)
+        if i >= n || string_at(obj_text, i) != ":" is return out end
+        i = skip_ws(obj_text, i + 1)
+        let vend: int = value_end(obj_text, i)
+        i = skip_ws(obj_text, vend)
+        if i < n && string_at(obj_text, i) == "," is
+            i = skip_ws(obj_text, i + 1)
+        end
+    end
+    return out
+end
+
+;; Cheap structural sanity check: starts like an object / array and brackets balance.
+pub fn looks_valid(text: string) -> bool is
+    let n: int = string_len(text)
+    let i: int = skip_ws(text, 0)
+    if i >= n is return false end
+    let c: string = string_at(text, i)
+    if c != "{" && c != "[" is return false end
+    let mut depth: int = 0
+    let mut j: int = i
+    while j < n is
+        let d: string = string_at(text, j)
+        if d == "\"" is
+            j = str_end(text, j)
+        else is
+            if d == "{" || d == "[" is depth += 1 end
+            if d == "}" || d == "]" is depth -= 1 end
+            j += 1
+            if depth == 0 is return skip_ws(text, j) == n end
+        end
+    end
+    return false
+end
