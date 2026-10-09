@@ -1,0 +1,142 @@
+mod util
+mod jx
+mod digest
+mod reference
+mod store
+mod image
+mod registry
+
+fn check(cond: bool, msg: string) is
+    assert(cond, msg)
+end
+
+fn same(a: string, b: string, what: string) is
+    assert(a == b, what + ": expected [" + b + "] got [" + a + "]")
+end
+
+fn mock_script() -> string is
+    if util::is_file("tests/mock_registry.py") is return "tests/mock_registry.py" end
+    if util::is_file("mock_registry.py") is return "mock_registry.py" end
+    return ""
+end
+
+;; Starts the mock registry; returns its port, or 0 when it cannot run here.
+fn start_mock(auth: bool) -> int is
+    let script: string = mock_script()
+    if script == "" || !util::tool_exists("python3") is return 0 end
+    let port: int = util::atoi(util::capture("shuf -i 20000-45000 -n 1"))
+    let flag: string = if auth then "" else "--no-auth"
+    util::run("nohup python3 " + util::sq(script) + " " + to_string(port) + " " + flag + " >/dev/null 2>&1 & echo $! > /tmp/mock-registry-" + to_string(port) + ".pid")
+    let mut tries: int = 0
+    while tries < 40 is
+        if util::quiet("curl -s -o /dev/null http://127.0.0.1:" + to_string(port) + "/v2/") == 0 is return port end
+        util::quiet("sleep 0.2")
+        tries += 1
+    end
+    return 0
+end
+
+fn stop_mock(port: int) is
+    let pf: string = "/tmp/mock-registry-" + to_string(port) + ".pid"
+    util::quiet("kill $(cat " + pf + ") ; rm -f " + pf)
+end
+
+fn sample_image(s: store::Store, dir: string, name: string) -> string is
+    util::write_file(dir + "/root/etc/hello", "hello registry\n")
+    util::write_file(dir + "/root/bin/tool", "#!/bin/sh\n")
+    util::quiet("tar -czf " + util::sq(dir + "/root.tar.gz") + " -C " + util::sq(dir + "/root") + " .")
+    let mut c: image::ImageConfig = image::new_config()
+    c.ic_cmd = ["/bin/tool"]
+    c.ic_env = ["MODE=test"]
+    return image::import_rootfs(s, dir + "/root.tar.gz", name, c)
+end
+
+#[test]
+fn registry_credentials_are_stored_and_found() is
+    let dir: string = util::capture("mktemp -d")
+    let s: store::Store = store::open(dir + "/store", dir + "/run", "vfs")
+    same(registry::credentials(s, "example.test"), "", "none yet")
+    check(registry::login(s, "example.test", "alice", "s3cret"), "login")
+    same(registry::credentials(s, "example.test"), "alice:s3cret", "found")
+    same(registry::credentials(s, "other.test"), "", "other host unaffected")
+    check(registry::login(s, "other.test", "bob", "pw"), "second login keeps the first")
+    same(registry::credentials(s, "example.test"), "alice:s3cret", "first still there")
+    check(registry::logout(s, "example.test"), "logout")
+    same(registry::credentials(s, "example.test"), "", "removed")
+    same(registry::credentials(s, "other.test"), "bob:pw", "other kept")
+    same(util::capture("stat -c %a " + util::sq(dir + "/store/auth.json")), "600", "private file")
+    util::rm_rf(dir)
+end
+
+#[test]
+fn registry_push_then_pull_roundtrip_with_token_auth() is
+    let port: int = start_mock(true)
+    if port == 0 is return end
+    let dir: string = util::capture("mktemp -d")
+    let a: store::Store = store::open(dir + "/a", dir + "/run", "vfs")
+    let b: store::Store = store::open(dir + "/b", dir + "/run", "vfs")
+    let id: string = sample_image(a, dir, "app:1")
+    check(id != "", "source image")
+    let target: string = "localhost:" + to_string(port) + "/team/app:1"
+    check(registry::push(a, "app:1", target), "push")
+    let got: string = registry::pull(b, target)
+    same(got, id, "pulled image has the same id")
+    let chains: [string] = image::layer_chains(b, got)
+    check(util::is_file(store::layers_dir(b) + "/" + chains[0] + "/diff/etc/hello"), "layer content arrived")
+    same(image::config_of(b, got).ic_cmd[0], "/bin/tool", "config arrived")
+    same(image::info(b, got).ii_digest, image::info(a, id).ii_digest, "manifest digest preserved")
+    check(image::exists(b, target), "named after the pulled reference")
+    stop_mock(port)
+    util::rm_rf(dir)
+end
+
+#[test]
+fn registry_pull_by_digest_and_missing_images() is
+    let port: int = start_mock(false)
+    if port == 0 is return end
+    let dir: string = util::capture("mktemp -d")
+    let a: store::Store = store::open(dir + "/a", dir + "/run", "vfs")
+    let b: store::Store = store::open(dir + "/b", dir + "/run", "vfs")
+    let id: string = sample_image(a, dir, "app:1")
+    let host: string = "localhost:" + to_string(port)
+    check(registry::push(a, "app:1", host + "/x/app:1"), "push")
+    let mdigest: string = image::info(a, id).ii_digest
+    same(registry::pull(b, host + "/x/app@" + mdigest), id, "pull by digest")
+    same(registry::pull(b, host + "/x/app:nope"), "", "unknown tag fails")
+    same(registry::pull(b, host + "/x/ghost:1"), "", "unknown repo fails")
+    same(registry::pull(b, host + "/x/app@sha256:" + string_repeat("00", 32)), "", "wrong digest fails")
+    stop_mock(port)
+    util::rm_rf(dir)
+end
+
+#[test]
+fn registry_pull_resolves_an_index() is
+    let port: int = start_mock(false)
+    if port == 0 is return end
+    let dir: string = util::capture("mktemp -d")
+    let a: store::Store = store::open(dir + "/a", dir + "/run", "vfs")
+    let b: store::Store = store::open(dir + "/b", dir + "/run", "vfs")
+    let id: string = sample_image(a, dir, "app:1")
+    let host: string = "localhost:" + to_string(port)
+    check(registry::push(a, "app:1", host + "/multi/app:plat"), "push platform image")
+    let md: string = image::info(a, id).ii_digest
+    let other: string = "sha256:" + string_repeat("ee", 32)
+    let entry1: string = jx::obj([jx::kv("mediaType", jx::q("application/vnd.oci.image.manifest.v1+json")), jx::kv("digest", jx::q(other)), jx::kv("size", "10"), jx::kv("platform", jx::obj([jx::kv("architecture", jx::q("s390x")), jx::kv("os", jx::q("linux"))]))])
+    let entry2: string = jx::obj([jx::kv("mediaType", jx::q("application/vnd.oci.image.manifest.v1+json")), jx::kv("digest", jx::q(md)), jx::kv("size", "10"), jx::kv("platform", jx::obj([jx::kv("architecture", jx::q(util::arch())), jx::kv("os", jx::q("linux"))]))])
+    let index: string = jx::obj([jx::kv("schemaVersion", "2"), jx::kv("mediaType", jx::q("application/vnd.oci.image.index.v1+json")), jx::kv("manifests", jx::arr([entry1, entry2]))])
+    util::write_file(dir + "/index.json", index)
+    check(util::quiet("curl -sf -X PUT -H 'Content-Type: application/vnd.oci.image.index.v1+json' --data-binary @" + util::sq(dir + "/index.json") + " http://127.0.0.1:" + to_string(port) + "/v2/multi/app/manifests/latest") == 0, "put index")
+    same(registry::pull(b, host + "/multi/app:latest"), id, "index resolved to this platform")
+    stop_mock(port)
+    util::rm_rf(dir)
+end
+
+#[test]
+fn registry_reports_unreachable_hosts() is
+    let dir: string = util::capture("mktemp -d")
+    let s: store::Store = store::open(dir + "/store", dir + "/run", "vfs")
+    same(registry::pull(s, "localhost:1/nothing:here"), "", "connection refused")
+    same(registry::pull(s, "NOT A NAME"), "", "invalid name")
+    check(!registry::push(s, "ghost:1", "localhost:1/x:y"), "push of unknown image")
+    util::rm_rf(dir)
+end
