@@ -1,0 +1,191 @@
+mod util
+mod store
+
+pub fn bridge_name() -> string is return "container0" end
+pub fn subnet() -> string is return "10.88.0.0/16" end
+pub fn gateway() -> string is return "10.88.0.1" end
+pub fn prefix() -> string is return "10.88." end
+
+pub fn valid_mode(mode: string) -> bool is
+    return mode == "host" || mode == "none" || mode == "bridge"
+end
+
+;; True when bridge networking can work on this host.
+pub fn available() -> bool is
+    return util::is_root() && util::tool_exists("ip") && util::tool_exists("nsenter")
+end
+
+;; ── Published ports ─────────────────────────────────────────────────────────
+
+pub struct PortMap is
+    pub pm_host_ip:   string
+    pub pm_host_port: int
+    pub pm_ctr_port:  int
+    pub pm_proto:     string
+    pub pm_ok:        bool
+end
+
+;; "8080:80", "127.0.0.1:8080:80", "8080:80/udp"
+pub fn parse_publish(spec_text: string) -> PortMap is
+    let mut body: string = spec_text
+    let mut proto: string = "tcp"
+    if string_contains(body, "/") is
+        proto = util::tail_after(body, "/")
+        body = util::head_before(body, "/")
+    end
+    let parts: [string] = string_split(body, ":")
+    let mut ip: string = ""
+    let mut hp: string = ""
+    let mut cp: string = ""
+    if array_len(parts) == 2 is
+        hp = parts[0]
+        cp = parts[1]
+    else if array_len(parts) == 3 is
+        ip = parts[0]
+        hp = parts[1]
+        cp = parts[2]
+    end
+    let ok: bool = util::is_number(hp) && util::is_number(cp) && (proto == "tcp" || proto == "udp")
+    return PortMap { pm_host_ip: ip, pm_host_port: util::atoi(hp), pm_ctr_port: util::atoi(cp), pm_proto: proto, pm_ok: ok }
+end
+
+;; ── Addresses ───────────────────────────────────────────────────────────────
+
+;; Picks the lowest free 10.88.x.y address, reserving it in <run>/ips/<ip>.
+pub fn alloc_ip(s: store::Store, id: string) -> string is
+    let dir: string = s.st_run + "/ips"
+    util::mkdir_p(dir)
+    let mut n: int = 2
+    while n < 65000 is
+        let ip: string = prefix() + to_string(n / 256) + "." + to_string(n % 256)
+        let host: int = n % 256
+        if host != 0 && host != 255 && !util::exists(dir + "/" + ip) is
+            util::write_file(dir + "/" + ip, id + "\n")
+            return ip
+        end
+        n += 1
+    end
+    return ""
+end
+
+pub fn release_ip(s: store::Store, ip: string) is
+    if ip != "" is util::quiet("rm -f " + util::sq(s.st_run + "/ips/" + ip)) end
+end
+
+;; resolv.conf for containers: the host's non-loopback resolvers, else public ones.
+pub fn resolv_conf() -> string is
+    let ls: [string] = util::lines(util::read("/etc/resolv.conf"))
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < array_len(ls) is
+        if string_starts_with(ls[i], "nameserver") && !string_contains(ls[i], "127.") && !string_contains(ls[i], "::1") is out = array_push(out, ls[i]) end
+        if string_starts_with(ls[i], "search") is out = array_push(out, ls[i]) end
+        i += 1
+    end
+    let mut has_ns: bool = false
+    let mut j: int = 0
+    while j < array_len(out) is
+        if string_starts_with(out[j], "nameserver") is has_ns = true end
+        j += 1
+    end
+    if !has_ns is out = array_concat(out, ["nameserver 1.1.1.1", "nameserver 8.8.8.8"]) end
+    return util::join(out, "\n") + "\n"
+end
+
+pub fn hosts_file(ip: string, hostname: string) -> string is
+    let mut lines: [string] = ["127.0.0.1\tlocalhost", "::1\tlocalhost ip6-localhost ip6-loopback"]
+    if ip != "" && hostname != "" is lines = array_push(lines, ip + "\t" + hostname) end
+    if ip == "" && hostname != "" is lines = array_push(lines, "127.0.0.1\t" + hostname) end
+    return util::join(lines, "\n") + "\n"
+end
+
+;; ── Plans ───────────────────────────────────────────────────────────────────
+
+pub fn host_if(id: string) -> string is
+    return "vh" + string_slice(id, 0, 8)
+end
+
+pub fn peer_if(id: string) -> string is
+    return "vc" + string_slice(id, 0, 8)
+end
+
+fn dnat_rule(id: string, op: string, pm: PortMap, ip: string) -> string is
+    let dst: string = if pm.pm_host_ip != "" then " -d " + pm.pm_host_ip else ""
+    return "iptables -t nat " + op + " PREROUTING -p " + pm.pm_proto + dst + " --dport " + to_string(pm.pm_host_port) + " -m comment --comment container-" + string_slice(id, 0, 12) + " -j DNAT --to-destination " + ip + ":" + to_string(pm.pm_ctr_port)
+end
+
+fn local_rule(id: string, op: string, pm: PortMap, ip: string) -> string is
+    return "iptables -t nat " + op + " OUTPUT -p " + pm.pm_proto + " -d 127.0.0.1 --dport " + to_string(pm.pm_host_port) + " -m comment --comment container-" + string_slice(id, 0, 12) + " -j DNAT --to-destination " + ip + ":" + to_string(pm.pm_ctr_port)
+end
+
+;; Commands that wire container `pid` (init of the new network namespace) to the bridge.
+pub fn plan_setup(id: string, pid: int, ip: string, publish: [string]) -> [string] is
+    let br: string = bridge_name()
+    let hv: string = host_if(id)
+    let pv: string = peer_if(id)
+    let ns: string = "nsenter -t " + to_string(pid) + " -n "
+    let mut cmds: [string] = []
+    cmds = array_push(cmds, "ip link show " + br + " >/dev/null 2>&1 || (ip link add " + br + " type bridge && ip addr add " + gateway() + "/16 dev " + br + " && ip link set " + br + " up)")
+    cmds = array_push(cmds, "ip link add " + hv + " type veth peer name " + pv)
+    cmds = array_push(cmds, "ip link set " + hv + " master " + br)
+    cmds = array_push(cmds, "ip link set " + hv + " up")
+    cmds = array_push(cmds, "ip link set " + pv + " netns " + to_string(pid))
+    cmds = array_push(cmds, ns + "ip link set lo up")
+    cmds = array_push(cmds, ns + "ip link set " + pv + " name eth0")
+    cmds = array_push(cmds, ns + "ip addr add " + ip + "/16 dev eth0")
+    cmds = array_push(cmds, ns + "ip link set eth0 up")
+    cmds = array_push(cmds, ns + "ip route add default via " + gateway())
+    cmds = array_push(cmds, "sysctl -qw net.ipv4.ip_forward=1")
+    cmds = array_push(cmds, "iptables -t nat -C POSTROUTING -s " + subnet() + " ! -o " + br + " -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s " + subnet() + " ! -o " + br + " -j MASQUERADE")
+    cmds = array_push(cmds, "sysctl -qw net.ipv4.conf." + br + ".route_localnet=1")
+    let mut i: int = 0
+    while i < array_len(publish) is
+        let pm: PortMap = parse_publish(publish[i])
+        if pm.pm_ok is
+            cmds = array_push(cmds, dnat_rule(id, "-A", pm, ip))
+            cmds = array_push(cmds, local_rule(id, "-A", pm, ip))
+        end
+        i += 1
+    end
+    return cmds
+end
+
+pub fn plan_teardown(id: string, ip: string, publish: [string]) -> [string] is
+    let mut cmds: [string] = []
+    let mut i: int = 0
+    while i < array_len(publish) is
+        let pm: PortMap = parse_publish(publish[i])
+        if pm.pm_ok is
+            cmds = array_push(cmds, dnat_rule(id, "-D", pm, ip))
+            cmds = array_push(cmds, local_rule(id, "-D", pm, ip))
+        end
+        i += 1
+    end
+    cmds = array_push(cmds, "ip link del " + host_if(id))
+    return cmds
+end
+
+fn run_all(cmds: [string], stop_on_error: bool) -> bool is
+    let mut ok: bool = true
+    let mut i: int = 0
+    while i < array_len(cmds) is
+        if util::quiet(cmds[i]) != 0 is
+            ok = false
+            if stop_on_error is
+                util::eprint("network: command failed: " + cmds[i])
+                return false
+            end
+        end
+        i += 1
+    end
+    return ok
+end
+
+pub fn setup(id: string, pid: int, ip: string, publish: [string]) -> bool is
+    return run_all(plan_setup(id, pid, ip, publish), true)
+end
+
+pub fn teardown(s: store::Store, id: string, ip: string, publish: [string]) is
+    run_all(plan_teardown(id, ip, publish), false)
+    release_ip(s, ip)
+end
