@@ -1,0 +1,655 @@
+mod util
+mod jx
+mod digest
+mod reference
+mod store
+
+pub struct ImageConfig is
+    pub ic_arch:       string
+    pub ic_os:         string
+    pub ic_cmd:        [string]
+    pub ic_entrypoint: [string]
+    pub ic_env:        [string]
+    pub ic_workdir:    string
+    pub ic_user:       string
+    pub ic_labels:     [string]    ;; key=value
+    pub ic_ports:      [string]    ;; "80/tcp"
+    pub ic_volumes:    [string]
+    pub ic_stopsignal: string
+    pub ic_diff_ids:   [string]
+    pub ic_history:    [string]    ;; created_by of each history entry
+    pub ic_created:    string
+end
+
+pub struct ImageInfo is
+    pub ii_id:      string
+    pub ii_names:   [string]
+    pub ii_created: string
+    pub ii_size:    int
+    pub ii_os:      string
+    pub ii_arch:    string
+    pub ii_layers:  int
+    pub ii_digest:  string
+end
+
+fn empty_obj() -> string is
+    return "{" + "}"
+end
+
+pub fn new_config() -> ImageConfig is
+    return ImageConfig { ic_arch: util::arch(), ic_os: "linux", ic_cmd: [], ic_entrypoint: [], ic_env: [], ic_workdir: "", ic_user: "", ic_labels: [], ic_ports: [], ic_volumes: [], ic_stopsignal: "", ic_diff_ids: [], ic_history: [], ic_created: "" }
+end
+
+;; ── Config <-> JSON ──────────────────────────────────────────────────────────
+
+fn set_of(names: [string]) -> string is
+    let mut parts: [string] = []
+    let mut i: int = 0
+    while i < array_len(names) is
+        parts = array_push(parts, jx::kv(names[i], empty_obj()))
+        i += 1
+    end
+    return jx::obj(parts)
+end
+
+fn labels_json(labels: [string]) -> string is
+    let mut parts: [string] = []
+    let mut i: int = 0
+    while i < array_len(labels) is
+        parts = array_push(parts, jx::kv(util::head_before(labels[i], "="), jx::q(util::tail_after(labels[i], "="))))
+        i += 1
+    end
+    return jx::obj(parts)
+end
+
+pub fn config_to_json(c: ImageConfig) -> string is
+    let created: string = util::or_default(c.ic_created, util::now_iso())
+    let mut cfg: [string] = []
+    if c.ic_user != "" is cfg = array_push(cfg, jx::kv("User", jx::q(c.ic_user))) end
+    if array_len(c.ic_ports) > 0 is cfg = array_push(cfg, jx::kv("ExposedPorts", set_of(c.ic_ports))) end
+    if array_len(c.ic_env) > 0 is cfg = array_push(cfg, jx::kv("Env", jx::str_arr(c.ic_env))) end
+    if array_len(c.ic_entrypoint) > 0 is cfg = array_push(cfg, jx::kv("Entrypoint", jx::str_arr(c.ic_entrypoint))) end
+    if array_len(c.ic_cmd) > 0 is cfg = array_push(cfg, jx::kv("Cmd", jx::str_arr(c.ic_cmd))) end
+    if array_len(c.ic_volumes) > 0 is cfg = array_push(cfg, jx::kv("Volumes", set_of(c.ic_volumes))) end
+    if c.ic_workdir != "" is cfg = array_push(cfg, jx::kv("WorkingDir", jx::q(c.ic_workdir))) end
+    if array_len(c.ic_labels) > 0 is cfg = array_push(cfg, jx::kv("Labels", labels_json(c.ic_labels))) end
+    if c.ic_stopsignal != "" is cfg = array_push(cfg, jx::kv("StopSignal", jx::q(c.ic_stopsignal))) end
+    let mut hist: [string] = []
+    let mut i: int = 0
+    while i < array_len(c.ic_history) is
+        hist = array_push(hist, jx::obj([jx::kv("created", jx::q(created)), jx::kv("created_by", jx::q(c.ic_history[i]))]))
+        i += 1
+    end
+    let rootfs: string = jx::obj([jx::kv("type", jx::q("layers")), jx::kv("diff_ids", jx::str_arr(c.ic_diff_ids))])
+    return jx::obj([jx::kv("created", jx::q(created)), jx::kv("architecture", jx::q(c.ic_arch)), jx::kv("os", jx::q(c.ic_os)), jx::kv("config", jx::obj(cfg)), jx::kv("rootfs", rootfs), jx::kv("history", jx::arr(hist))])
+end
+
+pub fn config_from_json(text: string) -> ImageConfig is
+    let cfg: string = jx::field(text, "config")
+    let mut c: ImageConfig = new_config()
+    c.ic_arch = util::or_default(jx::field_str(text, "architecture"), c.ic_arch)
+    c.ic_os = util::or_default(jx::field_str(text, "os"), "linux")
+    c.ic_created = jx::field_str(text, "created")
+    c.ic_cmd = jx::str_items(jx::field(cfg, "Cmd"))
+    c.ic_entrypoint = jx::str_items(jx::field(cfg, "Entrypoint"))
+    c.ic_env = jx::str_items(jx::field(cfg, "Env"))
+    c.ic_workdir = jx::field_str(cfg, "WorkingDir")
+    c.ic_user = jx::field_str(cfg, "User")
+    c.ic_stopsignal = jx::field_str(cfg, "StopSignal")
+    c.ic_ports = jx::keys(jx::field(cfg, "ExposedPorts"))
+    c.ic_volumes = jx::keys(jx::field(cfg, "Volumes"))
+    let labels: string = jx::field(cfg, "Labels")
+    let lk: [string] = jx::keys(labels)
+    let mut i: int = 0
+    while i < array_len(lk) is
+        c.ic_labels = array_push(c.ic_labels, lk[i] + "=" + jx::field_str(labels, lk[i]))
+        i += 1
+    end
+    c.ic_diff_ids = jx::str_items(jx::field(jx::field(text, "rootfs"), "diff_ids"))
+    let hist: [string] = jx::items(jx::field(text, "history"))
+    let mut j: int = 0
+    while j < array_len(hist) is
+        c.ic_history = array_push(c.ic_history, jx::field_str(hist[j], "created_by"))
+        j += 1
+    end
+    return c
+end
+
+;; ── Manifests ────────────────────────────────────────────────────────────────
+
+pub fn build_manifest(cfg_digest: string, cfg_size: int, layer_digests: [string], layer_sizes: [int], layer_types: [string]) -> string is
+    let mut layers: [string] = []
+    let mut i: int = 0
+    while i < array_len(layer_digests) is
+        layers = array_push(layers, jx::obj([jx::kv("mediaType", jx::q(layer_types[i])), jx::kv("digest", jx::q(layer_digests[i])), jx::kv("size", to_string(layer_sizes[i]))]))
+        i += 1
+    end
+    let cfg: string = jx::obj([jx::kv("mediaType", jx::q("application/vnd.oci.image.config.v1+json")), jx::kv("digest", jx::q(cfg_digest)), jx::kv("size", to_string(cfg_size))])
+    return jx::obj([jx::kv("schemaVersion", "2"), jx::kv("mediaType", jx::q("application/vnd.oci.image.manifest.v1+json")), jx::kv("config", cfg), jx::kv("layers", jx::arr(layers))])
+end
+
+pub fn is_index(manifest: string) -> bool is
+    let mt: string = jx::field_str(manifest, "mediaType")
+    if string_contains(mt, "index") || string_contains(mt, "manifest.list") is return true end
+    return jx::has_key(manifest, "manifests") && !jx::has_key(manifest, "layers")
+end
+
+;; Digest of the manifest in an OCI index / Docker manifest list matching `os`/`arch`.
+pub fn pick_manifest(index_json: string, os: string, arch: string) -> string is
+    let entries: [string] = jx::items(jx::field(index_json, "manifests"))
+    let mut i: int = 0
+    while i < array_len(entries) is
+        let p: string = jx::field(entries[i], "platform")
+        if jx::field_str(p, "os") == os && jx::field_str(p, "architecture") == arch is
+            return jx::field_str(entries[i], "digest")
+        end
+        i += 1
+    end
+    return ""
+end
+
+pub fn layer_media_type(blob: string) -> string is
+    let magic: string = util::capture("head -c4 " + util::sq(blob) + " | od -An -tx1 | tr -d ' \\n'")
+    if string_starts_with(magic, "1f8b") is return "application/vnd.oci.image.layer.v1.tar+gzip" end
+    if string_starts_with(magic, "28b52ffd") is return "application/vnd.oci.image.layer.v1.tar+zstd" end
+    return "application/vnd.oci.image.layer.v1.tar"
+end
+
+;; ── Layer unpacking ──────────────────────────────────────────────────────────
+
+;; Shell command that writes the uncompressed tar stream of a layer blob to stdout.
+pub fn decompress_cmd(blob: string) -> string is
+    let magic: string = util::capture("head -c4 " + util::sq(blob) + " | od -An -tx1 | tr -d ' \\n'")
+    let q: string = util::sq(blob)
+    if string_starts_with(magic, "1f8b") is return "gzip -dc " + q end
+    if string_starts_with(magic, "28b52ffd") is return "zstd -dc " + q end
+    if string_starts_with(magic, "fd377a58") is return "xz -dc " + q end
+    if string_starts_with(magic, "425a68") is return "bzip2 -dc " + q end
+    return "cat " + q
+end
+
+fn clean_entry(e: string) -> string is
+    let mut s: string = e
+    while string_starts_with(s, "./") is s = string_slice(s, 2, string_len(s)) end
+    while string_starts_with(s, "/") is s = string_slice(s, 1, string_len(s)) end
+    return s
+end
+
+;; True when some path component is exactly "..".
+fn has_dotdot(p: string) -> bool is
+    return util::has(string_split(p, "/"), "..")
+end
+
+fn dir_part(e: string) -> string is
+    let i: int = util::last_index(e, "/")
+    if i < 0 is return "" end
+    return string_slice(e, 0, i)
+end
+
+;; Applies OCI whiteouts listed in the tar stream to `dest` (vfs: delete; overlay: mknod / xattr).
+fn apply_whiteouts(dc: string, dest: string, overlay: bool) is
+    let found: string = util::capture(dc + " | tar -tf - 2>/dev/null | grep -E '(^|/)[.]wh[.]' || true")
+    let entries: [string] = util::lines(found)
+    let mut i: int = 0
+    while i < array_len(entries) is
+        let e: string = clean_entry(entries[i])
+        if !has_dotdot(e) is
+            let bn: string = util::basename(e)
+            let dn: string = dir_part(e)
+            let dir: string = if dn == "" then dest else dest + "/" + dn
+            if !has_dotdot(dn) is
+                if bn == ".wh..wh..opq" is
+                    if overlay is
+                        util::mkdir_p(dir)
+                        util::quiet("setfattr -n trusted.overlay.opaque -v y " + util::sq(dir))
+                    else is
+                        util::quiet("find " + util::sq(dir) + " -mindepth 1 -maxdepth 1 -exec rm -rf {{}} +")
+                    end
+                else is
+                    let victim: string = string_slice(bn, 4, string_len(bn))
+                    if overlay is
+                        util::mkdir_p(dir)
+                        util::quiet("mknod " + util::sq(dir + "/" + victim) + " c 0 0")
+                    else is
+                        util::quiet("rm -rf " + util::sq(dir + "/" + victim))
+                    end
+                end
+            end
+        end
+        i += 1
+    end
+end
+
+;; Unpacks a layer blob on top of `dest` with Docker/OCI semantics (whiteouts delete).
+;; Used to flatten images into a plain directory (builds).
+pub fn unpack_into(blob: string, dest: string) -> bool is
+    let dc: string = decompress_cmd(blob)
+    util::mkdir_p(dest)
+    apply_whiteouts(dc, dest, false)
+    let owner: string = if util::is_root() then "--same-owner -p" else "--no-same-owner"
+    return util::run_err(dc + " | tar -xf - -C " + util::sq(dest) + " " + owner + " --exclude='.wh.*'") <= 1
+end
+
+;; Unpacks one layer into layers/<chain-hex>/diff. `parent_chain` is "" for the base layer.
+;; vfs: diff is the complete rootfs (copy of the parent plus this layer).
+;; overlay: diff holds only this layer, with overlayfs-style whiteouts.
+pub fn layer_apply(s: store::Store, blob: string, diff_id: string, parent_chain: string, chain: string) -> bool is
+    let target: string = store::layers_dir(s) + "/" + digest::hex_of(chain)
+    if util::is_dir(target + "/diff") is return true end
+    let dc: string = decompress_cmd(blob)
+    if diff_id != "" && digest::of_command(dc) != diff_id is
+        util::eprint("layer digest mismatch for " + blob)
+        return false
+    end
+    let overlay: bool = s.st_driver == "overlay"
+    let tmp: string = store::scratch(s, "layer")
+    let dest: string = tmp + "/diff"
+    if !overlay && parent_chain != "" is
+        let src: string = store::layers_dir(s) + "/" + digest::hex_of(parent_chain) + "/diff"
+        if util::quiet("cp -a --reflink=auto " + util::sq(src) + " " + util::sq(dest)) != 0 is
+            util::eprint("cannot copy parent layer " + parent_chain)
+            util::rm_rf(tmp)
+            return false
+        end
+    else is
+        util::mkdir_p(dest)
+    end
+    apply_whiteouts(dc, dest, overlay)
+    let owner: string = if util::is_root() then "--same-owner -p" else "--no-same-owner"
+    let rc: int = util::run_err(dc + " | tar -xf - -C " + util::sq(dest) + " " + owner + " --exclude='.wh.*'")
+    if rc > 1 is
+        util::eprint("failed to unpack layer " + blob)
+        util::rm_rf(tmp)
+        return false
+    end
+    util::write_file(tmp + "/parent", parent_chain + "\n")
+    util::write_file(tmp + "/diff_id", diff_id + "\n")
+    util::mkdir_p(store::layers_dir(s))
+    util::quiet("mv " + util::sq(tmp) + " " + util::sq(target))
+    return util::is_dir(target + "/diff")
+end
+
+;; ── Image records ────────────────────────────────────────────────────────────
+
+fn record_dir(s: store::Store, id: string) -> string is
+    return store::images_dir(s) + "/" + id
+end
+
+pub fn image_ids(s: store::Store) -> [string] is
+    return util::lines(util::capture("ls -1 " + util::sq(store::images_dir(s)) + " 2>/dev/null"))
+end
+
+pub fn names_of(s: store::Store, id: string) -> [string] is
+    return util::lines(util::read(record_dir(s, id) + "/names"))
+end
+
+pub fn layer_chains(s: store::Store, id: string) -> [string] is
+    return util::lines(util::read(record_dir(s, id) + "/layers"))
+end
+
+;; Containers (by id) whose state says they were created from this image.
+pub fn used_by(s: store::Store, id: string) -> [string] is
+    let mut out: [string] = []
+    let ids: [string] = util::lines(util::capture("ls -1 " + util::sq(store::containers_dir(s)) + " 2>/dev/null"))
+    let mut i: int = 0
+    while i < array_len(ids) is
+        let st: string = util::read(store::containers_dir(s) + "/" + ids[i] + "/state")
+        if string_contains(st, "image=" + id + "\n") is out = array_push(out, ids[i]) end
+        i += 1
+    end
+    return out
+end
+
+;; Gives `name` (canonical) to image `id`, taking it away from any other image.
+pub fn tag_name(s: store::Store, id: string, name: string) is
+    let all: [string] = image_ids(s)
+    let mut i: int = 0
+    while i < array_len(all) is
+        if all[i] != id is
+            let names: [string] = names_of(s, all[i])
+            if util::has(names, name) is
+                util::write_file(record_dir(s, all[i]) + "/names", util::join(util::without(names, name), "\n") + "\n")
+            end
+        end
+        i += 1
+    end
+    let mine: [string] = names_of(s, id)
+    if !util::has(mine, name) is
+        util::write_file(record_dir(s, id) + "/names", util::join(array_concat(mine, [name]), "\n") + "\n")
+    end
+end
+
+;; Resolves an ID (or unique ID prefix), name or digest reference to an image id; "" if unknown.
+pub fn resolve(s: store::Store, ref_text: string) -> string is
+    let t: string = string_trim(ref_text)
+    if t == "" is return "" end
+    let ids: [string] = image_ids(s)
+    if util::is_hex(t) && string_len(t) >= 4 is
+        let mut hit: string = ""
+        let mut n: int = 0
+        let mut i: int = 0
+        while i < array_len(ids) is
+            if string_starts_with(ids[i], t) is
+                hit = ids[i]
+                n += 1
+            end
+            i += 1
+        end
+        if n == 1 is return hit end
+    end
+    let r: reference::Reference = reference::parse(t)
+    if !r.rf_ok is return "" end
+    let want: string = reference::canonical(r)
+    let mut j: int = 0
+    while j < array_len(ids) is
+        if util::has(names_of(s, ids[j]), want) is return ids[j] end
+        if r.rf_digest != "" && util::read_trim(record_dir(s, ids[j]) + "/manifest.digest") == r.rf_digest is return ids[j] end
+        j += 1
+    end
+    return ""
+end
+
+pub fn exists(s: store::Store, ref_text: string) -> bool is
+    return resolve(s, ref_text) != ""
+end
+
+pub fn config_of(s: store::Store, id: string) -> ImageConfig is
+    return config_from_json(util::read(record_dir(s, id) + "/config.json"))
+end
+
+pub fn config_text(s: store::Store, id: string) -> string is
+    return util::read(record_dir(s, id) + "/config.json")
+end
+
+pub fn info(s: store::Store, id: string) -> ImageInfo is
+    let d: string = record_dir(s, id)
+    let meta: string = util::read(d + "/meta.json")
+    let cfg: string = util::read(d + "/config.json")
+    return ImageInfo { ii_id: id, ii_names: names_of(s, id), ii_created: jx::field_str(cfg, "created"), ii_size: jx::field_int(meta, "size", 0), ii_os: jx::field_str(cfg, "os"), ii_arch: jx::field_str(cfg, "architecture"), ii_layers: array_len(layer_chains(s, id)), ii_digest: util::read_trim(d + "/manifest.digest") }
+end
+
+pub fn list(s: store::Store) -> [ImageInfo] is
+    let mut out: [ImageInfo] = []
+    let ids: [string] = image_ids(s)
+    let mut i: int = 0
+    while i < array_len(ids) is
+        out = array_push(out, info(s, ids[i]))
+        i += 1
+    end
+    return out
+end
+
+;; JSON description of an image (what `docker inspect` would show, trimmed).
+pub fn inspect(s: store::Store, ref_text: string) -> string is
+    let id: string = resolve(s, ref_text)
+    if id == "" is return "" end
+    let i: ImageInfo = info(s, id)
+    let d: string = record_dir(s, id)
+    return jx::obj([jx::kv("Id", jx::q("sha256:" + id)), jx::kv("RepoTags", jx::str_arr(i.ii_names)), jx::kv("Digest", jx::q(i.ii_digest)), jx::kv("Created", jx::q(i.ii_created)), jx::kv("Size", to_string(i.ii_size)), jx::kv("Architecture", jx::q(i.ii_arch)), jx::kv("Os", jx::q(i.ii_os)), jx::kv("Config", jx::field(util::read(d + "/config.json"), "config")), jx::kv("Layers", jx::str_arr(layer_chains(s, id)))])
+end
+
+;; Adds another name to an existing image.
+pub fn tag(s: store::Store, src: string, new_name: string) -> bool is
+    let id: string = resolve(s, src)
+    let r: reference::Reference = reference::parse(new_name)
+    if id == "" || !r.rf_ok is return false end
+    tag_name(s, id, reference::canonical(r))
+    return true
+end
+
+;; ── Install ──────────────────────────────────────────────────────────────────
+
+;; Installs an image whose manifest, config and layer blobs are already in the store.
+;; Returns the image id (hex of the config digest), or "" on failure.
+pub fn install(s: store::Store, manifest: string, names: [string]) -> string is
+    if !jx::looks_valid(manifest) || is_index(manifest) is
+        util::eprint("install: not an image manifest")
+        return ""
+    end
+    let cfg_digest: string = jx::field_str(jx::field(manifest, "config"), "digest")
+    let cfg_blob: string = store::blob_path(s, cfg_digest)
+    if !digest::verify_file(cfg_digest, cfg_blob) is
+        util::eprint("install: config blob missing or corrupt: " + cfg_digest)
+        return ""
+    end
+    let cfg: string = util::read(cfg_blob)
+    let diff_ids: [string] = jx::str_items(jx::field(jx::field(cfg, "rootfs"), "diff_ids"))
+    let layers: [string] = jx::items(jx::field(manifest, "layers"))
+    if array_len(layers) != array_len(diff_ids) is
+        util::eprint("install: manifest has " + to_string(array_len(layers)) + " layers but config has " + to_string(array_len(diff_ids)) + " diff ids")
+        return ""
+    end
+    let mut chains: [string] = []
+    let mut parent: string = ""
+    let mut total: int = 0
+    let mut i: int = 0
+    while i < array_len(layers) is
+        let ld: string = jx::field_str(layers[i], "digest")
+        let blob: string = store::blob_path(s, ld)
+        if !digest::verify_file(ld, blob) is
+            util::eprint("install: layer blob missing or corrupt: " + ld)
+            return ""
+        end
+        let chain: string = digest::chain_id(parent, diff_ids[i])
+        if !layer_apply(s, blob, diff_ids[i], parent, chain) is return "" end
+        chains = array_push(chains, digest::hex_of(chain))
+        parent = chain
+        i += 1
+    end
+    let mut j: int = 0
+    while j < array_len(chains) is
+        let ldir: string = store::layers_dir(s) + "/" + chains[j] + "/diff"
+        if s.st_driver == "overlay" || j == array_len(chains) - 1 is total += util::dir_size(ldir) end
+        j += 1
+    end
+    let id: string = digest::hex_of(cfg_digest)
+    let rec: string = record_dir(s, id)
+    util::mkdir_p(rec)
+    let mdigest: string = digest::of_string(manifest)
+    util::write_file(rec + "/manifest.json", manifest)
+    util::write_file(rec + "/manifest.digest", mdigest + "\n")
+    util::write_file(rec + "/config.json", cfg)
+    util::write_file(rec + "/layers", util::join(chains, "\n") + "\n")
+    util::write_file(rec + "/meta.json", jx::obj([jx::kv("size", to_string(total)), jx::kv("installed", jx::q(util::now_iso()))]) + "\n")
+    util::write_file(store::blob_path(s, mdigest), manifest)
+    if !util::exists(rec + "/names") is util::write_file(rec + "/names", "") end
+    let mut k: int = 0
+    while k < array_len(names) is
+        tag_name(s, id, names[k])
+        k += 1
+    end
+    return id
+end
+
+;; ── Import / export ──────────────────────────────────────────────────────────
+
+pub fn put_blob(s: store::Store, src: string) -> string is
+    let d: string = digest::of_file(src)
+    if d == "" is return "" end
+    let dst: string = store::blob_path(s, d)
+    if !util::exists(dst) is util::quiet("cp " + util::sq(src) + " " + util::sq(dst)) end
+    return d
+end
+
+pub fn put_text_blob(s: store::Store, text: string) -> string is
+    let d: string = digest::of_string(text)
+    let dst: string = store::blob_path(s, d)
+    if !util::exists(dst) is util::write_file(dst, text) end
+    return d
+end
+
+;; Creates a one-layer image from a rootfs tarball (like `docker import`).
+pub fn import_rootfs(s: store::Store, tarball: string, name: string, base: ImageConfig) -> string is
+    if !util::exists(tarball) is
+        util::eprint("import: no such file " + tarball)
+        return ""
+    end
+    let mut c: ImageConfig = base
+    let diff: string = digest::of_command(decompress_cmd(tarball))
+    if diff == "" is return "" end
+    let layer: string = put_blob(s, tarball)
+    c.ic_diff_ids = [diff]
+    c.ic_history = ["import " + util::basename(tarball)]
+    let cfg_text: string = config_to_json(c)
+    let cfg_digest: string = put_text_blob(s, cfg_text)
+    let manifest: string = build_manifest(cfg_digest, string_len(cfg_text), [layer], [util::file_size(tarball)], [layer_media_type(tarball)])
+    let mut names: [string] = []
+    if name != "" is
+        let r: reference::Reference = reference::parse(name)
+        if !r.rf_ok is
+            util::eprint("import: " + r.rf_error)
+            return ""
+        end
+        names = [reference::canonical(r)]
+    end
+    return install(s, manifest, names)
+end
+
+;; Writes an OCI image layout directory for an installed image.
+pub fn export_layout(s: store::Store, ref_text: string, dir: string) -> bool is
+    let id: string = resolve(s, ref_text)
+    if id == "" is return false end
+    let rec: string = record_dir(s, id)
+    let manifest: string = util::read(rec + "/manifest.json")
+    let mdigest: string = util::read_trim(rec + "/manifest.digest")
+    util::mkdir_p(dir + "/blobs/sha256")
+    util::write_file(dir + "/oci-layout", jx::obj([jx::kv("imageLayoutVersion", jx::q("1.0.0"))]) + "\n")
+    let mut digests: [string] = [mdigest, jx::field_str(jx::field(manifest, "config"), "digest")]
+    let layers: [string] = jx::items(jx::field(manifest, "layers"))
+    let mut i: int = 0
+    while i < array_len(layers) is
+        digests = array_push(digests, jx::field_str(layers[i], "digest"))
+        i += 1
+    end
+    let mut k: int = 0
+    while k < array_len(digests) is
+        let src: string = store::blob_path(s, digests[k])
+        if !util::exists(src) is
+            util::eprint("export: missing blob " + digests[k])
+            return false
+        end
+        util::quiet("cp " + util::sq(src) + " " + util::sq(dir + "/blobs/sha256/" + digest::hex_of(digests[k])))
+        k += 1
+    end
+    let names: [string] = names_of(s, id)
+    let mut ann: [string] = []
+    if array_len(names) > 0 is
+        ann = [jx::kv("annotations", jx::obj([jx::kv("org.opencontainers.image.ref.name", jx::q(names[0]))]))]
+    end
+    let mut entry: [string] = [jx::kv("mediaType", jx::q("application/vnd.oci.image.manifest.v1+json")), jx::kv("digest", jx::q(mdigest)), jx::kv("size", to_string(string_len(manifest)))]
+    entry = array_concat(entry, ann)
+    util::write_file(dir + "/index.json", jx::obj([jx::kv("schemaVersion", "2"), jx::kv("manifests", jx::arr([jx::obj(entry)]))]) + "\n")
+    return true
+end
+
+;; Installs the first (or platform-matching) image of an OCI layout directory.
+pub fn import_layout(s: store::Store, dir: string, name: string) -> string is
+    let index: string = util::read(dir + "/index.json")
+    if !jx::looks_valid(index) is
+        util::eprint("import: " + dir + " is not an OCI layout")
+        return ""
+    end
+    let entries: [string] = jx::items(jx::field(index, "manifests"))
+    if array_len(entries) == 0 is return "" end
+    let mut mdigest: string = jx::field_str(entries[0], "digest")
+    let mut ref_name: string = jx::field_str(jx::field(entries[0], "annotations"), "org.opencontainers.image.ref.name")
+    let blobs: string = dir + "/blobs/sha256/"
+    let mut manifest: string = util::read(blobs + digest::hex_of(mdigest))
+    if is_index(manifest) is
+        let pick: string = pick_manifest(manifest, "linux", util::arch())
+        if pick == "" is
+            util::eprint("import: no linux/" + util::arch() + " image in the index")
+            return ""
+        end
+        mdigest = pick
+        manifest = util::read(blobs + digest::hex_of(pick))
+    end
+    if digest::of_string(manifest) != mdigest is
+        util::eprint("import: manifest digest mismatch")
+        return ""
+    end
+    let mut needed: [string] = [jx::field_str(jx::field(manifest, "config"), "digest")]
+    let layers: [string] = jx::items(jx::field(manifest, "layers"))
+    let mut i: int = 0
+    while i < array_len(layers) is
+        needed = array_push(needed, jx::field_str(layers[i], "digest"))
+        i += 1
+    end
+    let mut k: int = 0
+    while k < array_len(needed) is
+        let src: string = blobs + digest::hex_of(needed[k])
+        if !digest::verify_file(needed[k], src) is
+            util::eprint("import: blob missing or corrupt: " + needed[k])
+            return ""
+        end
+        put_blob(s, src)
+        k += 1
+    end
+    let mut names: [string] = []
+    let chosen: string = util::or_default(name, ref_name)
+    if chosen != "" is
+        let r: reference::Reference = reference::parse(chosen)
+        if r.rf_ok is names = [reference::canonical(r)] end
+    end
+    return install(s, manifest, names)
+end
+
+;; ── Removal and garbage collection ───────────────────────────────────────────
+
+;; Deletes layers and blobs that no image refers to any more.
+pub fn gc(s: store::Store) is
+    let ids: [string] = image_ids(s)
+    let mut keep_layers: [string] = []
+    let mut keep_blobs: [string] = []
+    let mut i: int = 0
+    while i < array_len(ids) is
+        keep_layers = array_concat(keep_layers, layer_chains(s, ids[i]))
+        let rec: string = record_dir(s, ids[i])
+        let manifest: string = util::read(rec + "/manifest.json")
+        keep_blobs = array_push(keep_blobs, digest::hex_of(util::read_trim(rec + "/manifest.digest")))
+        keep_blobs = array_push(keep_blobs, digest::hex_of(jx::field_str(jx::field(manifest, "config"), "digest")))
+        let layers: [string] = jx::items(jx::field(manifest, "layers"))
+        let mut j: int = 0
+        while j < array_len(layers) is
+            keep_blobs = array_push(keep_blobs, digest::hex_of(jx::field_str(layers[j], "digest")))
+            j += 1
+        end
+        i += 1
+    end
+    let all_layers: [string] = util::lines(util::capture("ls -1 " + util::sq(store::layers_dir(s)) + " 2>/dev/null"))
+    let mut k: int = 0
+    while k < array_len(all_layers) is
+        if !util::has(keep_layers, all_layers[k]) && string_len(all_layers[k]) == 64 is
+            util::rm_rf(store::layers_dir(s) + "/" + all_layers[k])
+        end
+        k += 1
+    end
+    let all_blobs: [string] = util::lines(util::capture("ls -1 " + util::sq(store::blobs_dir(s)) + " 2>/dev/null"))
+    let mut b: int = 0
+    while b < array_len(all_blobs) is
+        if !util::has(keep_blobs, all_blobs[b]) && string_len(all_blobs[b]) == 64 is
+            util::quiet("rm -f " + util::sq(store::blobs_dir(s) + "/" + all_blobs[b]))
+        end
+        b += 1
+    end
+end
+
+;; Removes a name; deletes the image itself when it was the last one (or when `force`
+;; is set / the reference was an id).  Refuses while containers still use the image.
+pub fn remove(s: store::Store, ref_text: string, force: bool) -> bool is
+    let id: string = resolve(s, ref_text)
+    if id == "" is return false end
+    let names: [string] = names_of(s, id)
+    let r: reference::Reference = reference::parse(ref_text)
+    if r.rf_ok && !force && array_len(names) > 1 && util::has(names, reference::canonical(r)) is
+        util::write_file(record_dir(s, id) + "/names", util::join(util::without(names, reference::canonical(r)), "\n") + "\n")
+        return true
+    end
+    if array_len(used_by(s, id)) > 0 && !force is
+        util::eprint("image is used by containers: " + util::join(used_by(s, id), ", "))
+        return false
+    end
+    util::rm_rf(record_dir(s, id))
+    gc(s)
+    return true
+end
