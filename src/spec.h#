@@ -1,0 +1,186 @@
+mod util
+mod jx
+
+pub struct Spec is
+    pub sp_args:       [string]
+    pub sp_env:        [string]    ;; KEY=value
+    pub sp_cwd:        string
+    pub sp_user:       string      ;; "uid", "uid:gid" (names are resolved by the runtime)
+    pub sp_hostname:   string
+    pub sp_rootfs:     string      ;; path of the root filesystem
+    pub sp_readonly:   bool
+    pub sp_mounts:     [string]    ;; "source:destination[:ro|rw]"  (bind mounts)
+    pub sp_caps:       [string]    ;; "CAP_CHOWN", ...
+    pub sp_namespaces: [string]    ;; pid, network, ipc, uts, mount, cgroup, user
+    pub sp_mem:        int         ;; bytes, 0 = unlimited
+    pub sp_cpu_quota:  int         ;; microseconds per period, 0 = unlimited
+    pub sp_cpu_period: int
+    pub sp_pids:       int         ;; 0 = unlimited
+    pub sp_no_new_privs: bool
+    pub sp_terminal:   bool
+end
+
+pub fn default_caps() -> [string] is
+    return ["CAP_CHOWN", "CAP_DAC_OVERRIDE", "CAP_FSETID", "CAP_FOWNER", "CAP_MKNOD", "CAP_NET_RAW", "CAP_SETGID", "CAP_SETUID", "CAP_SETFCAP", "CAP_SETPCAP", "CAP_NET_BIND_SERVICE", "CAP_SYS_CHROOT", "CAP_KILL", "CAP_AUDIT_WRITE"]
+end
+
+pub fn default_namespaces() -> [string] is
+    return ["pid", "ipc", "uts", "mount"]
+end
+
+pub fn masked_paths() -> [string] is
+    return ["/proc/acpi", "/proc/kcore", "/proc/keys", "/proc/latency_stats", "/proc/timer_list", "/proc/timer_stats", "/proc/sched_debug", "/proc/scsi", "/sys/firmware"]
+end
+
+pub fn readonly_paths() -> [string] is
+    return ["/proc/bus", "/proc/fs", "/proc/irq", "/proc/sys", "/proc/sysrq-trigger"]
+end
+
+pub fn new_spec(rootfs: string) -> Spec is
+    return Spec { sp_args: ["/bin/sh"], sp_env: ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"], sp_cwd: "/", sp_user: "0:0", sp_hostname: "", sp_rootfs: rootfs, sp_readonly: false, sp_mounts: [], sp_caps: default_caps(), sp_namespaces: default_namespaces(), sp_mem: 0, sp_cpu_quota: 0, sp_cpu_period: 100000, sp_pids: 0, sp_no_new_privs: true, sp_terminal: false }
+end
+
+;; "CAP_NET_RAW" <-> "net_raw" (the spelling setpriv wants).
+pub fn cap_short(cap: string) -> string is
+    let l: string = string_lower(cap)
+    if string_starts_with(l, "cap_") is return string_slice(l, 4, string_len(l)) end
+    return l
+end
+
+pub fn cap_long(cap: string) -> string is
+    let u: string = string_upper(cap)
+    if string_starts_with(u, "CAP_") is return u end
+    return "CAP_" + u
+end
+
+;; Applies `--cap-add` / `--cap-drop` style changes ("ALL" is understood for both).
+pub fn adjust_caps(base: [string], add: [string], drop: [string]) -> [string] is
+    let mut caps: [string] = base
+    let mut i: int = 0
+    while i < array_len(drop) is
+        if string_upper(drop[i]) == "ALL" is
+            caps = []
+        else is
+            caps = util::without(caps, cap_long(drop[i]))
+        end
+        i += 1
+    end
+    let mut j: int = 0
+    while j < array_len(add) is
+        if string_upper(add[j]) != "ALL" && !util::has(caps, cap_long(add[j])) is caps = array_push(caps, cap_long(add[j])) end
+        j += 1
+    end
+    return caps
+end
+
+pub fn uid_of(user: string) -> int is
+    return util::atoi(util::head_before(user, ":"))
+end
+
+pub fn gid_of(user: string) -> int is
+    if !string_contains(user, ":") is return 0 end
+    return util::atoi(util::tail_after(user, ":"))
+end
+
+;; Turns "name", "name:group" or "uid:gid" into numeric "uid:gid" using the rootfs's
+;; /etc/passwd and /etc/group.  Unknown names are returned unchanged.
+pub fn resolve_user(rootfs: string, user: string) -> string is
+    if user == "" is return "0:0" end
+    let u: string = util::head_before(user, ":")
+    let g: string = if string_contains(user, ":") then util::tail_after(user, ":") else ""
+    let mut uid: string = u
+    let mut gid: string = g
+    let passwd: string = util::read(rootfs + "/etc/passwd")
+    if !util::is_number(u) is
+        uid = ""
+        let ls: [string] = util::lines(passwd)
+        let mut i: int = 0
+        while i < array_len(ls) is
+            let f: [string] = string_split(ls[i], ":")
+            if array_len(f) >= 4 && f[0] == u is
+                uid = f[2]
+                if g == "" is gid = f[3] end
+            end
+            i += 1
+        end
+        if uid == "" is return user end
+    else is
+        if g == "" is
+            let ls2: [string] = util::lines(passwd)
+            let mut k: int = 0
+            while k < array_len(ls2) is
+                let f2: [string] = string_split(ls2[k], ":")
+                if array_len(f2) >= 4 && f2[2] == u is gid = f2[3] end
+                k += 1
+            end
+        end
+    end
+    if g != "" && !util::is_number(g) is
+        gid = ""
+        let gl: [string] = util::lines(util::read(rootfs + "/etc/group"))
+        let mut j: int = 0
+        while j < array_len(gl) is
+            let gf: [string] = string_split(gl[j], ":")
+            if array_len(gf) >= 3 && gf[0] == g is gid = gf[2] end
+            j += 1
+        end
+        if gid == "" is return user end
+    end
+    if gid == "" is gid = "0" end
+    return uid + ":" + gid
+end
+
+;; Splits "source:destination[:opts]" (the source may not contain ':').
+pub fn mount_source(m: string) -> string is
+    return util::head_before(m, ":")
+end
+
+pub fn mount_dest(m: string) -> string is
+    return util::head_before(util::tail_after(m, ":"), ":")
+end
+
+pub fn mount_readonly(m: string) -> bool is
+    let rest: string = util::tail_after(util::tail_after(m, ":"), ":")
+    return rest == "ro" || string_starts_with(rest, "ro,")
+end
+
+fn mount_json(dest: string, kind: string, source: string, opts: [string]) -> string is
+    return jx::obj([jx::kv("destination", jx::q(dest)), jx::kv("type", jx::q(kind)), jx::kv("source", jx::q(source)), jx::kv("options", jx::str_arr(opts))])
+end
+
+fn ns_json(spec_ns: [string]) -> string is
+    let mut parts: [string] = []
+    let mut i: int = 0
+    while i < array_len(spec_ns) is
+        parts = array_push(parts, jx::obj([jx::kv("type", jx::q(spec_ns[i]))]))
+        i += 1
+    end
+    return jx::arr(parts)
+end
+
+;; The complete OCI runtime-spec 1.0 document.
+pub fn to_json(sp: Spec) -> string is
+    let ug: string = jx::obj([jx::kv("uid", to_string(uid_of(sp.sp_user))), jx::kv("gid", to_string(gid_of(sp.sp_user)))])
+    let caps: string = jx::str_arr(sp.sp_caps)
+    let capset: string = jx::obj([jx::kv("bounding", caps), jx::kv("effective", caps), jx::kv("inheritable", caps), jx::kv("permitted", caps)])
+    let rl: string = jx::obj([jx::kv("type", jx::q("RLIMIT_NOFILE")), jx::kv("hard", "1048576"), jx::kv("soft", "1048576")])
+    let proc_obj: string = jx::obj([jx::kv("terminal", if sp.sp_terminal then "true" else "false"), jx::kv("user", ug), jx::kv("args", jx::str_arr(sp.sp_args)), jx::kv("env", jx::str_arr(sp.sp_env)), jx::kv("cwd", jx::q(sp.sp_cwd)), jx::kv("capabilities", capset), jx::kv("rlimits", jx::arr([rl])), jx::kv("noNewPrivileges", if sp.sp_no_new_privs then "true" else "false")])
+    let root: string = jx::obj([jx::kv("path", jx::q(sp.sp_rootfs)), jx::kv("readonly", if sp.sp_readonly then "true" else "false")])
+    let mut mounts: [string] = [mount_json("/proc", "proc", "proc", ["nosuid", "noexec", "nodev"]), mount_json("/dev", "tmpfs", "tmpfs", ["nosuid", "strictatime", "mode=755", "size=65536k"]), mount_json("/dev/pts", "devpts", "devpts", ["nosuid", "noexec", "newinstance", "ptmxmode=0666", "mode=0620", "gid=5"]), mount_json("/dev/shm", "tmpfs", "shm", ["nosuid", "noexec", "nodev", "mode=1777", "size=65536k"]), mount_json("/sys", "sysfs", "sysfs", ["nosuid", "noexec", "nodev", "ro"])]
+    let mut i: int = 0
+    while i < array_len(sp.sp_mounts) is
+        let m: string = sp.sp_mounts[i]
+        mounts = array_push(mounts, mount_json(mount_dest(m), "bind", mount_source(m), ["rbind", if mount_readonly(m) then "ro" else "rw"]))
+        i += 1
+    end
+    let mut res: [string] = []
+    if sp.sp_mem > 0 is res = array_push(res, jx::kv("memory", jx::obj([jx::kv("limit", to_string(sp.sp_mem))]))) end
+    if sp.sp_cpu_quota > 0 is res = array_push(res, jx::kv("cpu", jx::obj([jx::kv("quota", to_string(sp.sp_cpu_quota)), jx::kv("period", to_string(sp.sp_cpu_period))]))) end
+    if sp.sp_pids > 0 is res = array_push(res, jx::kv("pids", jx::obj([jx::kv("limit", to_string(sp.sp_pids))]))) end
+    let linux: string = jx::obj([jx::kv("resources", jx::obj(res)), jx::kv("namespaces", ns_json(sp.sp_namespaces)), jx::kv("maskedPaths", jx::str_arr(masked_paths())), jx::kv("readonlyPaths", jx::str_arr(readonly_paths()))])
+    let mut top: [string] = [jx::kv("ociVersion", jx::q("1.0.2")), jx::kv("process", proc_obj), jx::kv("root", root)]
+    if sp.sp_hostname != "" is top = array_push(top, jx::kv("hostname", jx::q(sp.sp_hostname))) end
+    top = array_push(top, jx::kv("mounts", jx::arr(mounts)))
+    top = array_push(top, jx::kv("linux", linux))
+    return jx::obj(top) + "\n"
+end
