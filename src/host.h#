@@ -1,0 +1,59 @@
+mod util
+mod store
+mod cgroup
+mod network
+
+pub struct HostInfo is
+    pub hi_arch:     string
+    pub hi_kernel:   string
+    pub hi_root:     bool
+    pub hi_cgroup:   int         ;; 1 or 2
+    pub hi_cgroup_ok: bool       ;; limits can be applied
+    pub hi_overlay:  bool        ;; overlayfs driver usable
+    pub hi_userns:   bool        ;; unprivileged-style user namespaces work
+    pub hi_bridge:   bool        ;; bridge networking possible
+    pub hi_missing:  [string]    ;; required tools that are not installed
+    pub hi_optional: [string]    ;; optional tools that are not installed
+end
+
+pub fn required_tools() -> [string] is
+    return ["unshare", "nsenter", "pivot_root", "mount", "umount", "setpriv", "tar", "gzip", "curl", "sha256sum", "find", "sort", "comm", "cut", "mkfifo", "cp", "ps"]
+end
+
+pub fn optional_tools() -> [string] is
+    return ["ip", "iptables", "setfattr", "zstd", "xz", "bzip2"]
+end
+
+fn missing_of(tools: [string]) -> [string] is
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < array_len(tools) is
+        if !util::tool_exists(tools[i]) is out = array_push(out, tools[i]) end
+        i += 1
+    end
+    return out
+end
+
+pub fn info() -> HostInfo is
+    return HostInfo { hi_arch: util::arch(), hi_kernel: util::capture("uname -r"), hi_root: util::is_root(), hi_cgroup: cgroup::version(), hi_cgroup_ok: cgroup::available(), hi_overlay: store::overlay_usable(), hi_userns: util::quiet("unshare --user --map-root-user true") == 0, hi_bridge: network::available() && util::tool_exists("iptables"), hi_missing: missing_of(required_tools()), hi_optional: missing_of(optional_tools()) }
+end
+
+fn mark(good: bool, text: string) -> string is
+    if good is return "ok       " + text end
+    return "MISSING  " + text
+end
+
+;; A human readable report, one line per check.
+pub fn doctor() -> [string] is
+    let h: HostInfo = info()
+    let mut out: [string] = []
+    out = array_push(out, "host     " + h.hi_arch + ", kernel " + h.hi_kernel + (if h.hi_root then ", running as root" else ", running unprivileged"))
+    out = array_push(out, mark(array_len(h.hi_missing) == 0, "required tools" + (if array_len(h.hi_missing) == 0 then "" else ": " + util::join(h.hi_missing, ", "))))
+    out = array_push(out, mark(h.hi_root, "root privileges (needed for mounts, pivot_root, cgroups, bridge networking)"))
+    out = array_push(out, mark(h.hi_cgroup_ok, "cgroup v" + to_string(h.hi_cgroup) + " resource limits"))
+    out = array_push(out, mark(h.hi_overlay, "overlayfs storage driver (otherwise `vfs` copies layers)"))
+    out = array_push(out, mark(h.hi_userns, "user namespaces (needed for unprivileged use)"))
+    out = array_push(out, mark(h.hi_bridge, "bridge networking (ip + iptables + root)"))
+    if array_len(h.hi_optional) > 0 is out = array_push(out, "optional tools not installed: " + util::join(h.hi_optional, ", ")) end
+    return out
+end
