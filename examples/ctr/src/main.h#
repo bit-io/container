@@ -1,0 +1,234 @@
+use "bit -> container"
+
+extern static [c] is
+    fn exit(code: int)
+end
+
+fn arg_at(a: [string], i: int) -> string is
+    if i < array_len(a) is return a[i] end
+    return ""
+end
+
+fn short(id: string) -> string is
+    return string_slice(id, 0, 12)
+end
+
+fn usage() is
+    write("usage: ctr <doctor|pull|images|rmi|run|ps|logs|stop|rm|exec|inspect|build|save|load|import|push|login> ...")
+end
+
+fn fail(msg: string) is
+    write("ctr: " + msg)
+    exit(1)
+end
+
+fn cmd_images(s: container::store::Store) is
+    write(string_pad_right("IMAGE ID", 14) + string_pad_right("SIZE", 14) + "NAMES")
+    let all = container::image_list(s)
+    let mut i: int = 0
+    while i < array_len(all) is
+        let it = all[i]
+        let mut names: string = ""
+        let mut n: int = 0
+        while n < array_len(it.ii_names) is
+            if n > 0 is names = names + ", " end
+            names = names + it.ii_names[n]
+            n += 1
+        end
+        write(string_pad_right(short(it.ii_id), 14) + string_pad_right(to_string(it.ii_size / 1024) + " KiB", 14) + names)
+        i += 1
+    end
+end
+
+fn cmd_ps(s: container::store::Store) is
+    write(string_pad_right("CONTAINER", 14) + string_pad_right("STATUS", 10) + string_pad_right("NAME", 18) + string_pad_right("IMAGE", 22) + "COMMAND")
+    let all = container::container_list(s)
+    let mut i: int = 0
+    while i < array_len(all) is
+        let c = all[i]
+        write(string_pad_right(short(c.ci_id), 14) + string_pad_right(c.ci_status, 10) + string_pad_right(c.ci_name, 18) + string_pad_right(c.ci_image, 22) + c.ci_command)
+        i += 1
+    end
+end
+
+;; run [flags] IMAGE [COMMAND...]
+fn cmd_run(s: container::store::Store, a: [string]) -> int is
+    let mut o = container::container_options("")
+    let mut i: int = 2
+    let mut image_ref: string = ""
+    while i < array_len(a) && image_ref == "" is
+        let f: string = a[i]
+        if f == "-d" || f == "--detach" is
+            o = container::set_option(o, "detach", "true")
+        else if f == "--rm" is
+            o = container::set_option(o, "rm", "true")
+        else if f == "--read-only" is
+            o = container::set_option(o, "readonly", "true")
+        else if f == "--privileged" is
+            o = container::set_option(o, "privileged", "true")
+        else if f == "--name" is
+            i += 1
+            o = container::set_option(o, "name", arg_at(a, i))
+        else if f == "-e" || f == "--env" is
+            i += 1
+            o = container::add_option(o, "env", arg_at(a, i))
+        else if f == "-v" || f == "--volume" is
+            i += 1
+            o = container::add_option(o, "volume", arg_at(a, i))
+        else if f == "-p" || f == "--publish" is
+            i += 1
+            o = container::add_option(o, "publish", arg_at(a, i))
+        else if f == "-m" || f == "--memory" is
+            i += 1
+            o = container::set_option(o, "memory", arg_at(a, i))
+        else if f == "--cpus" is
+            i += 1
+            o = container::set_option(o, "cpus", arg_at(a, i))
+        else if f == "--pids" is
+            i += 1
+            o = container::set_option(o, "pids", arg_at(a, i))
+        else if f == "--net" || f == "--network" is
+            i += 1
+            o = container::set_option(o, "network", arg_at(a, i))
+        else if f == "-u" || f == "--user" is
+            i += 1
+            o = container::set_option(o, "user", arg_at(a, i))
+        else if f == "-w" || f == "--workdir" is
+            i += 1
+            o = container::set_option(o, "workdir", arg_at(a, i))
+        else if f == "--hostname" is
+            i += 1
+            o = container::set_option(o, "hostname", arg_at(a, i))
+        else is
+            image_ref = f
+        end
+        i += 1
+    end
+    if image_ref == "" is
+        fail("run: missing IMAGE")
+    end
+    o = container::set_option(o, "image", image_ref)
+    let mut cmd: [string] = []
+    while i < array_len(a) is
+        cmd = array_push(cmd, a[i])
+        i += 1
+    end
+    o = container::set_command(o, cmd)
+    if !container::image_exists(s, image_ref) is
+        write("Unable to find image '" + image_ref + "' locally, pulling...")
+        if container::image_pull(s, image_ref) == "" is fail("cannot pull " + image_ref) end
+    end
+    if container::option_flag(o, "detach") is
+        let id: string = container::container_create(s, o)
+        if id == "" is return 1 end
+        if container::container_start(s, id, false) != 0 is return 1 end
+        write(id)
+        return 0
+    end
+    return container::container_run(s, o)
+end
+
+fn find_or_fail(s: container::store::Store, ref_text: string) -> string is
+    let id: string = container::container_find(s, ref_text)
+    if id == "" is fail("no such container: " + ref_text) end
+    return id
+end
+
+fn main() is
+    let a: [string] = env::args()
+    let cmd: string = arg_at(a, 1)
+    if cmd == "" || cmd == "help" || cmd == "--help" is
+        usage()
+        return
+    end
+    if cmd == "doctor" is
+        let lines = container::doctor()
+        let mut i: int = 0
+        while i < array_len(lines) is
+            write(lines[i])
+            i += 1
+        end
+        return
+    end
+    let s = container::open_default_store()
+    if cmd == "pull" is
+        let id: string = container::image_pull(s, arg_at(a, 2))
+        if id == "" is exit(1) end
+        write(short(id))
+    else if cmd == "images" is
+        cmd_images(s)
+    else if cmd == "rmi" is
+        if !container::image_remove(s, arg_at(a, 2), false) is exit(1) end
+    else if cmd == "ps" is
+        cmd_ps(s)
+    else if cmd == "run" is
+        exit(cmd_run(s, a))
+    else if cmd == "logs" is
+        write(container::container_logs(s, find_or_fail(s, arg_at(a, 2))))
+    else if cmd == "stop" is
+        if !container::container_stop(s, find_or_fail(s, arg_at(a, 2)), 10) is exit(1) end
+    else if cmd == "rm" is
+        if !container::container_remove(s, find_or_fail(s, arg_at(a, 2)), false) is exit(1) end
+    else if cmd == "exec" is
+        let id: string = find_or_fail(s, arg_at(a, 2))
+        let mut argv: [string] = []
+        let mut i: int = 3
+        while i < array_len(a) is
+            argv = array_push(argv, a[i])
+            i += 1
+        end
+        exit(container::container_exec(s, id, argv, [], "", ""))
+    else if cmd == "inspect" is
+        let id: string = container::container_find(s, arg_at(a, 2))
+        if id != "" is
+            write(container::container_inspect(s, id))
+        else is
+            write(container::image_inspect(s, arg_at(a, 2)))
+        end
+    else if cmd == "build" is
+        let mut tag: string = ""
+        let mut file: string = ""
+        let mut net: string = "host"
+        let mut bargs: [string] = []
+        let mut ctx: string = "."
+        let mut i: int = 2
+        while i < array_len(a) is
+            if a[i] == "-t" is
+                i += 1
+                tag = arg_at(a, i)
+            else if a[i] == "-f" is
+                i += 1
+                file = arg_at(a, i)
+            else if a[i] == "--net" is
+                i += 1
+                net = arg_at(a, i)
+            else if a[i] == "--build-arg" is
+                i += 1
+                bargs = array_push(bargs, arg_at(a, i))
+            else is
+                ctx = a[i]
+            end
+            i += 1
+        end
+        let id: string = container::build_image(s, ctx, file, tag, bargs, net)
+        if id == "" is exit(1) end
+        write(short(id))
+    else if cmd == "save" is
+        if !container::image_export(s, arg_at(a, 2), arg_at(a, 3)) is exit(1) end
+    else if cmd == "load" is
+        let id: string = container::image_load(s, arg_at(a, 2), arg_at(a, 3))
+        if id == "" is exit(1) end
+        write(short(id))
+    else if cmd == "import" is
+        let id: string = container::image_import(s, arg_at(a, 2), arg_at(a, 3))
+        if id == "" is exit(1) end
+        write(short(id))
+    else if cmd == "push" is
+        if !container::image_push(s, arg_at(a, 2), arg_at(a, 3)) is exit(1) end
+    else if cmd == "login" is
+        container::registry_login(s, arg_at(a, 2), arg_at(a, 3), arg_at(a, 4))
+    else is
+        usage()
+        exit(2)
+    end
+end
