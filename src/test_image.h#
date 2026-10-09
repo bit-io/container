@@ -1,0 +1,265 @@
+mod util
+mod jx
+mod digest
+mod reference
+mod store
+mod image
+
+fn check(cond: bool, msg: string) is
+    assert(cond, msg)
+end
+
+fn same(a: string, b: string, what: string) is
+    assert(a == b, what + ": expected [" + b + "] got [" + a + "]")
+end
+
+fn same_int(a: int, b: int, what: string) is
+    assert(a == b, what + ": expected " + to_string(b) + " got " + to_string(a))
+end
+
+fn sandbox() -> string is
+    return util::capture("mktemp -d")
+end
+
+fn open_store(dir: string) -> store::Store is
+    return store::open(dir + "/store", dir + "/run", "vfs")
+end
+
+;; Writes a tar of `dir` to `out` (gzip-compressed when `gz`).
+fn tar_of(dir: string, out: string, gz: bool) is
+    if gz is
+        util::quiet("tar -czf " + util::sq(out) + " -C " + util::sq(dir) + " .")
+    else is
+        util::quiet("tar -cf " + util::sq(out) + " -C " + util::sq(dir) + " .")
+    end
+end
+
+;; A tiny rootfs: a few files, no executables needed.
+fn tiny_rootfs(dir: string) is
+    util::write_file(dir + "/etc/os-release", "NAME=tiny\n")
+    util::write_file(dir + "/a.txt", "a\n")
+    util::write_file(dir + "/d/x", "x\n")
+    util::write_file(dir + "/d/y", "y\n")
+end
+
+;; Installs a hand-made two-layer image: layer 2 whites out a.txt and replaces d/.
+fn two_layer_image(s: store::Store, work: string) -> string is
+    let l1: string = work + "/l1"
+    tiny_rootfs(l1)
+    tar_of(l1, work + "/l1.tar.gz", true)
+    let l2: string = work + "/l2"
+    util::write_file(l2 + "/.wh.a.txt", "")
+    util::write_file(l2 + "/d/.wh..wh..opq", "")
+    util::write_file(l2 + "/d/z", "z\n")
+    tar_of(l2, work + "/l2.tar", false)
+    let d1: string = digest::of_file(work + "/l1.tar.gz")
+    let d2: string = digest::of_file(work + "/l2.tar")
+    util::quiet("cp " + util::sq(work + "/l1.tar.gz") + " " + util::sq(store::blob_path(s, d1)))
+    util::quiet("cp " + util::sq(work + "/l2.tar") + " " + util::sq(store::blob_path(s, d2)))
+    let mut c: image::ImageConfig = image::new_config()
+    c.ic_cmd = ["/bin/sh"]
+    c.ic_diff_ids = [digest::of_command(image::decompress_cmd(work + "/l1.tar.gz")), digest::of_file(work + "/l2.tar")]
+    c.ic_history = ["layer one", "layer two"]
+    let cfg: string = image::config_to_json(c)
+    let cd: string = digest::of_string(cfg)
+    util::write_file(store::blob_path(s, cd), cfg)
+    let m: string = image::build_manifest(cd, string_len(cfg), [d1, d2], [util::file_size(work + "/l1.tar.gz"), util::file_size(work + "/l2.tar")], [image::layer_media_type(work + "/l1.tar.gz"), image::layer_media_type(work + "/l2.tar")])
+    return image::install(s, m, ["docker.io/library/two:latest"])
+end
+
+#[test]
+fn store_creates_its_layout() is
+    let dir: string = sandbox()
+    let s: store::Store = open_store(dir)
+    check(util::is_dir(dir + "/store/blobs/sha256"), "blobs dir")
+    check(util::is_dir(dir + "/store/layers"), "layers dir")
+    check(util::is_dir(dir + "/store/containers"), "containers dir")
+    same(s.st_driver, "vfs", "driver")
+    same(jx::field_str(util::read(dir + "/store/store.json"), "driver"), "vfs", "store.json")
+    let again: store::Store = store::open(dir + "/store", dir + "/run", "")
+    same(again.st_driver, "vfs", "driver is remembered")
+    check(string_ends_with(store::blob_path(s, "sha256:abc"), "/blobs/sha256/abc"), "blob path")
+    util::rm_rf(dir)
+end
+
+#[test]
+fn image_config_roundtrips_through_json() is
+    let mut c: image::ImageConfig = image::new_config()
+    c.ic_cmd = ["/bin/sh", "-c", "echo \"hi\""]
+    c.ic_entrypoint = ["/entry"]
+    c.ic_env = ["A=1", "PATH=/bin"]
+    c.ic_workdir = "/work"
+    c.ic_user = "1000:1000"
+    c.ic_labels = ["k=v", "x=y=z"]
+    c.ic_ports = ["80/tcp", "53/udp"]
+    c.ic_volumes = ["/data"]
+    c.ic_diff_ids = ["sha256:" + string_repeat("ab", 32)]
+    c.ic_history = ["step"]
+    let back: image::ImageConfig = image::config_from_json(image::config_to_json(c))
+    same(util::join(back.ic_cmd, "|"), "/bin/sh|-c|echo \"hi\"", "cmd")
+    same(util::join(back.ic_entrypoint, "|"), "/entry", "entrypoint")
+    same(util::join(back.ic_env, "|"), "A=1|PATH=/bin", "env")
+    same(back.ic_workdir, "/work", "workdir")
+    same(back.ic_user, "1000:1000", "user")
+    same(util::join(back.ic_labels, "|"), "k=v|x=y=z", "labels")
+    same(util::join(back.ic_ports, "|"), "80/tcp|53/udp", "ports")
+    same(util::join(back.ic_volumes, "|"), "/data", "volumes")
+    same(back.ic_diff_ids[0], c.ic_diff_ids[0], "diff id")
+    same(back.ic_history[0], "step", "history")
+    same(back.ic_arch, util::arch(), "arch")
+end
+
+#[test]
+fn image_picks_manifest_for_platform() is
+    let idx: string = "{\"schemaVersion\":2,\"manifests\":[{\"digest\":\"sha256:aa\",\"platform\":{\"architecture\":\"arm64\",\"os\":\"linux\"}},{\"digest\":\"sha256:bb\",\"platform\":{\"architecture\":\"amd64\",\"os\":\"linux\"}},{\"digest\":\"sha256:cc\",\"platform\":{\"architecture\":\"amd64\",\"os\":\"windows\"}}]}"
+    check(image::is_index(idx), "is index")
+    same(image::pick_manifest(idx, "linux", "amd64"), "sha256:bb", "amd64")
+    same(image::pick_manifest(idx, "linux", "arm64"), "sha256:aa", "arm64")
+    same(image::pick_manifest(idx, "linux", "s390x"), "", "none")
+    check(!image::is_index(image::build_manifest("sha256:c", 1, [], [], [])), "manifest is not an index")
+end
+
+#[test]
+fn image_import_rootfs_and_lookup() is
+    let dir: string = sandbox()
+    let s: store::Store = open_store(dir)
+    tiny_rootfs(dir + "/root")
+    tar_of(dir + "/root", dir + "/root.tar", false)
+    let mut c: image::ImageConfig = image::new_config()
+    c.ic_cmd = ["/bin/sh"]
+    let id: string = image::import_rootfs(s, dir + "/root.tar", "tiny:1", c)
+    check(string_len(id) == 64, "image id is a sha256 hex")
+    same(image::resolve(s, "tiny:1"), id, "by name")
+    same(image::resolve(s, "docker.io/library/tiny:1"), id, "by canonical name")
+    same(image::resolve(s, string_slice(id, 0, 12)), id, "by id prefix")
+    same(image::resolve(s, "tiny:2"), "", "unknown tag")
+    check(image::exists(s, "tiny:1"), "exists")
+    let layers: [string] = image::layer_chains(s, id)
+    same_int(array_len(layers), 1, "one layer")
+    check(util::is_file(store::layers_dir(s) + "/" + layers[0] + "/diff/etc/os-release"), "layer unpacked")
+    let list: [image::ImageInfo] = image::list(s)
+    same_int(array_len(list), 1, "list")
+    same(list[0].ii_names[0], "docker.io/library/tiny:1", "listed name")
+    check(list[0].ii_size > 0, "size recorded")
+    let cfg: image::ImageConfig = image::config_of(s, id)
+    same(cfg.ic_cmd[0], "/bin/sh", "config cmd")
+    let insp: string = image::inspect(s, "tiny:1")
+    check(jx::looks_valid(insp), "inspect is json")
+    same(jx::field_str(insp, "Id"), "sha256:" + id, "inspect id")
+    util::rm_rf(dir)
+end
+
+#[test]
+fn image_layers_apply_whiteouts() is
+    let dir: string = sandbox()
+    let s: store::Store = open_store(dir)
+    let id: string = two_layer_image(s, dir)
+    check(string_len(id) == 64, "installed")
+    let chains: [string] = image::layer_chains(s, id)
+    same_int(array_len(chains), 2, "two layers")
+    let top: string = store::layers_dir(s) + "/" + chains[1] + "/diff"
+    check(!util::exists(top + "/a.txt"), "a.txt was whited out")
+    check(util::is_file(top + "/etc/os-release"), "unrelated file kept")
+    check(util::is_file(top + "/d/z"), "new file in opaque dir")
+    check(!util::exists(top + "/d/x"), "opaque dir hides lower files")
+    check(!util::exists(top + "/d/.wh..wh..opq"), "marker not extracted")
+    let base: string = store::layers_dir(s) + "/" + chains[0] + "/diff"
+    check(util::is_file(base + "/a.txt"), "lower layer untouched")
+    util::rm_rf(dir)
+end
+
+#[test]
+fn image_install_rejects_corrupt_blobs() is
+    let dir: string = sandbox()
+    let s: store::Store = open_store(dir)
+    tiny_rootfs(dir + "/root")
+    tar_of(dir + "/root", dir + "/root.tar", false)
+    let id: string = image::import_rootfs(s, dir + "/root.tar", "bad:1", image::new_config())
+    check(id != "", "first install")
+    let rec: string = util::read(store::images_dir(s) + "/" + id + "/manifest.json")
+    let layer: string = jx::field_str(jx::items(jx::field(rec, "layers"))[0], "digest")
+    util::rm_rf(store::images_dir(s) + "/" + id)
+    util::rm_rf(store::layers_dir(s))
+    util::mkdir_p(store::layers_dir(s))
+    util::write_file(store::blob_path(s, layer), "garbage")
+    same(image::install(s, rec, ["bad:1"]), "", "corrupt layer is refused")
+    check(!image::exists(s, "bad:1"), "nothing registered")
+    util::rm_rf(dir)
+end
+
+#[test]
+fn image_tag_and_remove() is
+    let dir: string = sandbox()
+    let s: store::Store = open_store(dir)
+    tiny_rootfs(dir + "/root")
+    tar_of(dir + "/root", dir + "/root.tar", false)
+    let id: string = image::import_rootfs(s, dir + "/root.tar", "tiny:1", image::new_config())
+    check(image::tag(s, "tiny:1", "mirror.local/tiny:stable"), "tag")
+    same(image::resolve(s, "mirror.local/tiny:stable"), id, "new name resolves")
+    same_int(array_len(image::names_of(s, id)), 2, "two names")
+    check(image::remove(s, "tiny:1", false), "untag")
+    check(image::exists(s, "mirror.local/tiny:stable"), "still there under the other name")
+    util::write_file(store::containers_dir(s) + "/c1/state", "image=" + id + "\nstatus=created\n")
+    check(!image::remove(s, "mirror.local/tiny:stable", false), "refused while a container uses it")
+    check(image::remove(s, "mirror.local/tiny:stable", true), "forced removal")
+    check(!image::exists(s, "mirror.local/tiny:stable"), "gone")
+    same_int(array_len(util::lines(util::capture("ls " + util::sq(store::layers_dir(s))))), 0, "layers collected")
+    same_int(array_len(util::lines(util::capture("ls " + util::sq(store::blobs_dir(s))))), 0, "blobs collected")
+    util::rm_rf(dir)
+end
+
+#[test]
+fn image_layout_roundtrip_between_stores() is
+    let dir: string = sandbox()
+    let a: store::Store = store::open(dir + "/a", dir + "/run", "vfs")
+    let b: store::Store = store::open(dir + "/b", dir + "/run", "vfs")
+    let id: string = two_layer_image(a, dir)
+    check(image::export_layout(a, "two:latest", dir + "/oci"), "export")
+    check(util::is_file(dir + "/oci/oci-layout"), "oci-layout")
+    check(jx::looks_valid(util::read(dir + "/oci/index.json")), "index.json")
+    let id2: string = image::import_layout(b, dir + "/oci", "")
+    same(id2, id, "same image id after import")
+    same(image::resolve(b, "two:latest"), id, "name travelled in the annotation")
+    let chains: [string] = image::layer_chains(b, id2)
+    check(!util::exists(store::layers_dir(b) + "/" + chains[1] + "/diff/a.txt"), "whiteout applied in the second store")
+    util::quiet("echo tampered >> " + util::sq(dir + "/oci/blobs/sha256/" + digest::hex_of(jx::field_str(jx::items(jx::field(util::read(store::images_dir(a) + "/" + id + "/manifest.json"), "layers"))[1], "digest"))))
+    let c: store::Store = store::open(dir + "/c", dir + "/run", "vfs")
+    same(image::import_layout(c, dir + "/oci", ""), "", "tampered layout is rejected")
+    util::rm_rf(dir)
+end
+
+#[test]
+fn image_gc_keeps_shared_layers() is
+    let dir: string = sandbox()
+    let s: store::Store = open_store(dir)
+    tiny_rootfs(dir + "/r1")
+    tar_of(dir + "/r1", dir + "/r1.tar", false)
+    let a: string = image::import_rootfs(s, dir + "/r1.tar", "one:1", image::new_config())
+    let mut c2: image::ImageConfig = image::new_config()
+    c2.ic_cmd = ["/other"]
+    let b: string = image::import_rootfs(s, dir + "/r1.tar", "two:1", c2)
+    check(a != b, "different configs give different ids")
+    same(image::layer_chains(s, a)[0], image::layer_chains(s, b)[0], "layer shared")
+    check(image::remove(s, "one:1", false), "remove first")
+    check(util::is_dir(store::layers_dir(s) + "/" + image::layer_chains(s, b)[0] + "/diff"), "shared layer survives")
+    check(image::exists(s, "two:1"), "second image intact")
+    util::rm_rf(dir)
+end
+
+#[test]
+fn image_overlay_driver_stores_whiteouts_natively() is
+    if !store::overlay_usable() is return end
+    let dir: string = sandbox()
+    let s: store::Store = store::open(dir + "/store", dir + "/run", "overlay")
+    same(s.st_driver, "overlay", "driver")
+    let id: string = two_layer_image(s, dir)
+    check(id != "", "installed")
+    let chains: [string] = image::layer_chains(s, id)
+    let top: string = store::layers_dir(s) + "/" + chains[1] + "/diff"
+    check(util::quiet("test -c " + util::sq(top + "/a.txt")) == 0, "whiteout is a 0/0 character device")
+    check(string_contains(util::capture("getfattr -n trusted.overlay.opaque --only-values " + util::sq(top + "/d") + " 2>&1"), "y"), "opaque directory marker")
+    check(util::is_file(top + "/d/z"), "new file kept")
+    check(!util::exists(top + "/etc/os-release"), "layer holds only its own changes")
+    check(util::is_file(store::layers_dir(s) + "/" + chains[0] + "/diff/a.txt"), "base layer intact")
+    util::rm_rf(dir)
+end
