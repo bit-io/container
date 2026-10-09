@@ -1,0 +1,250 @@
+mod util
+mod jx
+mod reference
+mod digest
+
+fn check(cond: bool, msg: string) is
+    assert(cond, msg)
+end
+
+fn same(a: string, b: string, what: string) is
+    assert(a == b, what + ": expected [" + b + "] got [" + a + "]")
+end
+
+fn same_int(a: int, b: int, what: string) is
+    assert(a == b, what + ": expected " + to_string(b) + " got " + to_string(a))
+end
+
+;; ── util ─────────────────────────────────────────────────────────────────────
+
+#[test]
+fn util_quotes_shell_arguments() is
+    same(util::sq("a b"), "'a b'", "plain")
+    same(util::sq("it's"), "'it'\\''s'", "single quote")
+end
+
+#[test]
+fn util_atoi_and_sizes() is
+    same_int(util::atoi("42"), 42, "42")
+    same_int(util::atoi(" -7 "), 0 - 7, "-7")
+    same_int(util::atoi("12abc"), 12, "12abc")
+    same_int(util::atoi(""), 0, "empty")
+    same_int(util::parse_size("512m"), 536870912, "512m")
+    same_int(util::parse_size("2g"), 2147483648, "2g")
+    same_int(util::parse_size("100k"), 102400, "100k")
+    same_int(util::parse_size("1024"), 1024, "1024")
+    same_int(util::parse_size("lots"), 0, "lots")
+end
+
+#[test]
+fn util_paths() is
+    same(util::basename("/a/b/c.tar"), "c.tar", "basename")
+    same(util::basename("/a/b/"), "b", "basename trailing slash")
+    same(util::dirname("/a/b/c"), "/a/b", "dirname")
+    same(util::dirname("/a"), "/", "dirname root")
+    same(util::dirname("file"), ".", "dirname bare")
+end
+
+#[test]
+fn util_lists() is
+    let a: [string] = ["x", "y", "z"]
+    check(util::has(a, "y"), "has y")
+    check(!util::has(a, "q"), "no q")
+    same(util::join(util::without(a, "y"), ","), "x,z", "without")
+    same_int(array_len(util::lines("a\n\n  b  \n")), 2, "lines")
+    same(util::join(util::csv("a, b ,,c"), "|"), "a|b|c", "csv")
+    same(util::head_before("a:b:c", ":"), "a", "head_before")
+    same(util::tail_after("a:b:c", ":"), "b:c", "tail_after")
+end
+
+#[test]
+fn util_files_roundtrip() is
+    let dir: string = util::capture("mktemp -d")
+    let f: string = dir + "/sub/dir/file.txt"
+    util::write_file(f, "line1\nline2\n")
+    check(util::is_file(f), "file exists")
+    check(util::is_dir(dir + "/sub"), "dir exists")
+    same(util::read(f), "line1\nline2\n", "content")
+    same_int(util::file_size(f), 12, "size")
+    util::append_line(f, "line3")
+    check(string_contains(util::read(f), "line3"), "appended")
+    check(util::rm_rf(dir), "removed")
+    check(!util::exists(dir), "gone")
+end
+
+#[test]
+fn util_rm_rf_refuses_dangerous_paths() is
+    check(!util::rm_rf("/"), "root")
+    check(!util::rm_rf("/etc"), "etc")
+    check(!util::rm_rf("/tmp/../etc"), "dotdot")
+    check(!util::rm_rf(""), "empty")
+end
+
+#[test]
+fn util_run_reports_exit_codes() is
+    same_int(util::run("exit 0"), 0, "ok")
+    same_int(util::run("exit 3"), 3, "three")
+    check(util::ok("true"), "true")
+    check(!util::ok("false"), "false")
+    same(util::capture("echo hi"), "hi", "capture")
+end
+
+;; ── json ─────────────────────────────────────────────────────────────────────
+
+fn sample() -> string is
+    return "{\"name\": \"alpine\", \"n\": 3, \"ok\": true, \"tags\": [\"a\", \"b,c\", \"d\"], \"cfg\": {\"Cmd\": [\"/bin/sh\", \"-c\"], \"Env\": [\"A=1\"], \"deep\": {\"k\": \"v\\\"q\"}}, \"nothing\": null}"
+end
+
+#[test]
+fn json_reads_scalars() is
+    let j: string = sample()
+    same(jx::field_str(j, "name"), "alpine", "name")
+    same_int(jx::field_int(j, "n", 0), 3, "n")
+    check(jx::field_bool(j, "ok", false), "ok")
+    same_int(jx::field_int(j, "missing", 9), 9, "fallback")
+    same(jx::field_str(j, "nothing"), "", "null is empty")
+    check(jx::has_key(j, "cfg"), "has cfg")
+    check(!jx::has_key(j, "zzz"), "no zzz")
+end
+
+#[test]
+fn json_reads_nested_values() is
+    let j: string = sample()
+    let cfg: string = jx::field(j, "cfg")
+    same(jx::field_str(jx::field(cfg, "deep"), "k"), "v\"q", "escaped quote")
+    let cmd: [string] = jx::str_items(jx::field(cfg, "Cmd"))
+    same_int(array_len(cmd), 2, "cmd len")
+    same(cmd[0], "/bin/sh", "cmd0")
+    let tags: [string] = jx::str_items(jx::field(j, "tags"))
+    same_int(array_len(tags), 3, "tags len")
+    same(tags[1], "b,c", "comma inside string")
+end
+
+#[test]
+fn json_keys_and_items() is
+    let j: string = sample()
+    same(util::join(jx::keys(j), ","), "name,n,ok,tags,cfg,nothing", "keys")
+    let objs: [string] = jx::items("[{\"a\":1},{\"a\":2},{\"a\":[1,2]}]")
+    same_int(array_len(objs), 3, "objects")
+    same_int(jx::field_int(objs[1], "a", 0), 2, "second")
+    same_int(array_len(jx::items("[]")), 0, "empty array")
+    same_int(array_len(jx::items("  [ 1 , 2 , 3 ] ")), 3, "numbers")
+end
+
+#[test]
+fn json_unquotes_escapes() is
+    same(jx::decode_str("\"a\\nb\\tc\""), "a\nb\tc", "newline tab")
+    same(jx::decode_str("\"x\\u0026y\\u003cz\""), "x&y<z", "unicode escapes")
+    same(jx::decode_str("\"back\\\\slash\""), "back\\slash", "backslash")
+    same(jx::decode_str("plain"), "plain", "not quoted")
+end
+
+#[test]
+fn json_writes_documents() is
+    same(jx::q("a\"b\n"), "\"a\\\"b\\n\"", "q")
+    same(jx::str_arr(["x", "y"]), "[\"x\",\"y\"]", "str_arr")
+    let o: string = jx::obj([jx::kv("a", "1"), jx::kv("b", jx::q("two"))])
+    same(o, "{\"a\":1,\"b\":\"two\"}", "obj")
+    check(jx::looks_valid(o), "valid object")
+    check(!jx::looks_valid("{\"a\":"), "unbalanced")
+    check(!jx::looks_valid("nope"), "not json")
+    same(jx::field_str(o, "b"), "two", "roundtrip")
+end
+
+;; ── reference ────────────────────────────────────────────────────────────────
+
+#[test]
+fn reference_defaults_to_docker_hub() is
+    let r: reference::Reference = reference::parse("alpine")
+    check(r.rf_ok, "ok")
+    same(reference::canonical(r), "docker.io/library/alpine:latest", "canonical")
+    same(reference::familiar(r), "alpine:latest", "familiar")
+    same(reference::api_host(r), "registry-1.docker.io", "api host")
+    same(reference::api_reference(r), "latest", "api ref")
+end
+
+#[test]
+fn reference_parses_user_and_registry_names() is
+    let a: reference::Reference = reference::parse("user/app:1.2")
+    same(reference::canonical(a), "docker.io/user/app:1.2", "user/app")
+    let b: reference::Reference = reference::parse("ghcr.io/org/app")
+    same(b.rf_domain, "ghcr.io", "domain")
+    same(b.rf_path, "org/app", "path")
+    same(b.rf_tag, "latest", "tag")
+    let c: reference::Reference = reference::parse("localhost:5000/team/web:dev")
+    same(c.rf_domain, "localhost:5000", "port domain")
+    same(c.rf_tag, "dev", "port tag")
+    check(reference::is_insecure(c.rf_domain), "localhost is plain http")
+    same(reference::scheme_for("ghcr.io"), "https", "https")
+    same(reference::scheme_for("localhost:5000"), "http", "http")
+end
+
+#[test]
+fn reference_parses_digests() is
+    let hex: string = string_repeat("ab", 32)
+    let r: reference::Reference = reference::parse("alpine@sha256:" + hex)
+    check(r.rf_ok, "ok")
+    same(r.rf_tag, "", "no tag")
+    same(r.rf_digest, "sha256:" + hex, "digest")
+    same(reference::api_reference(r), "sha256:" + hex, "api ref is digest")
+    let t: reference::Reference = reference::parse("alpine:3.20@sha256:" + hex)
+    same(t.rf_tag, "3.20", "tag kept next to digest")
+    same(reference::name_only(t), "docker.io/library/alpine", "name only")
+end
+
+#[test]
+fn reference_rejects_bad_names() is
+    check(!reference::parse("").rf_ok, "empty")
+    check(!reference::parse("UPPER/case").rf_ok, "uppercase")
+    check(!reference::parse("a b").rf_ok, "space")
+    check(!reference::parse("alpine:").rf_ok, "empty tag")
+    check(!reference::parse("alpine@sha256:123").rf_ok, "short digest")
+    check(!reference::parse("-bad/name").rf_ok, "leading dash")
+    check(!reference::parse("docker.io//x").rf_ok, "double slash")
+    check(reference::parse("docker://busybox").rf_ok, "docker:// prefix")
+end
+
+#[test]
+fn reference_with_tag_and_digest() is
+    let r: reference::Reference = reference::parse("ghcr.io/o/a:1")
+    same(reference::canonical(reference::with_tag(r, "2")), "ghcr.io/o/a:2", "with_tag")
+    let hex: string = string_repeat("0f", 32)
+    same(reference::canonical(reference::with_digest(r, "sha256:" + hex)), "ghcr.io/o/a@sha256:" + hex, "with_digest")
+end
+
+;; ── digest ───────────────────────────────────────────────────────────────────
+
+#[test]
+fn digest_of_known_strings() is
+    same(digest::of_string(""), "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "empty")
+    same(digest::of_string("abc"), "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", "abc")
+end
+
+#[test]
+fn digest_of_files_and_verification() is
+    let dir: string = util::capture("mktemp -d")
+    let f: string = dir + "/blob"
+    util::write_file(f, "abc")
+    let d: string = digest::of_file(f)
+    same(d, "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", "file digest")
+    check(digest::verify_file(d, f), "verifies")
+    util::write_file(f, "abd")
+    check(!digest::verify_file(d, f), "detects change")
+    same(digest::of_file(dir + "/missing"), "", "missing file")
+    same(digest::of_command("printf abc"), "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", "command")
+    util::rm_rf(dir)
+end
+
+#[test]
+fn digest_validity_and_chain_ids() is
+    check(digest::valid("sha256:" + string_repeat("0a", 32)), "valid")
+    check(!digest::valid("sha256:xyz"), "invalid")
+    check(!digest::valid("md5:" + string_repeat("0a", 32)), "wrong algo")
+    same(digest::hex_of("sha256:abc"), "abc", "hex_of")
+    let d0: string = "sha256:" + string_repeat("11", 32)
+    let d1: string = "sha256:" + string_repeat("22", 32)
+    same(digest::chain_id("", d0), d0, "first layer")
+    let c1: string = digest::chain_id(d0, d1)
+    check(digest::valid(c1), "chain is a digest")
+    same(c1, digest::of_string(d0 + " " + d1), "chain formula")
+end
