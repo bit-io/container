@@ -1,1 +1,290 @@
+mod util
+mod jx
+mod digest
+mod reference
+mod store
+mod image
+mod registry
+mod spec
+mod cgroup
+mod network
+mod runtime
+mod build
+mod host
 
+
+pub fn version() -> string is
+    return "0.1.0"
+end
+
+;; ── References and digests ───────────────────────────────────────────────────
+
+pub fn parse_reference(name: string) -> reference::Reference is
+    return reference::parse(name)
+end
+
+pub fn reference_canonical(r: reference::Reference) -> string is
+    return reference::canonical(r)
+end
+
+pub fn reference_familiar(r: reference::Reference) -> string is
+    return reference::familiar(r)
+end
+
+pub fn digest_of_file(path: string) -> string is
+    return digest::of_file(path)
+end
+
+pub fn digest_of_string(text: string) -> string is
+    return digest::of_string(text)
+end
+
+pub fn digest_valid(d: string) -> bool is
+    return digest::valid(d)
+end
+
+;; ── Store ────────────────────────────────────────────────────────────────────
+
+;; root / run_root "" = defaults (/var/lib/container, /run/container; per-user when
+;; not root; overridable with CONTAINER_ROOT / CONTAINER_RUNROOT).
+;; driver: "" (remembered, else overlay when usable, else vfs), "overlay" or "vfs".
+pub fn open_store(root: string, run_root: string, driver: string) -> store::Store is
+    return store::open(root, run_root, driver)
+end
+
+pub fn open_default_store() -> store::Store is
+    return store::open("", "", "")
+end
+
+pub fn default_store_root() -> string is
+    return store::default_root()
+end
+
+;; ── Images ───────────────────────────────────────────────────────────────────
+
+;; Downloads an image from its registry. Returns the image id, or "" on failure.
+pub fn image_pull(s: store::Store, name: string) -> string is
+    return registry::pull(s, name)
+end
+
+;; Uploads a local image to `destination` (e.g. "ghcr.io/me/app:1").
+pub fn image_push(s: store::Store, source: string, destination: string) -> bool is
+    return registry::push(s, source, destination)
+end
+
+pub fn image_list(s: store::Store) -> [image::ImageInfo] is
+    return image::list(s)
+end
+
+;; Image id for a name / id prefix / digest reference, "" when unknown.
+pub fn image_resolve(s: store::Store, ref_text: string) -> string is
+    return image::resolve(s, ref_text)
+end
+
+pub fn image_exists(s: store::Store, ref_text: string) -> bool is
+    return image::exists(s, ref_text)
+end
+
+;; JSON description of an image ("" when unknown).
+pub fn image_inspect(s: store::Store, ref_text: string) -> string is
+    return image::inspect(s, ref_text)
+end
+
+pub fn image_config(s: store::Store, ref_text: string) -> image::ImageConfig is
+    return image::config_of(s, image::resolve(s, ref_text))
+end
+
+pub fn image_tag(s: store::Store, source: string, new_name: string) -> bool is
+    return image::tag(s, source, new_name)
+end
+
+;; Removes a name (or the image when it was its last one). Refuses while containers use
+;; it unless `force`.
+pub fn image_remove(s: store::Store, ref_text: string, force: bool) -> bool is
+    return image::remove(s, ref_text, force)
+end
+
+;; Creates an image from a root filesystem tarball (like `docker import`).
+pub fn image_import(s: store::Store, tarball: string, name: string) -> string is
+    return image::import_rootfs(s, tarball, name, image::new_config())
+end
+
+;; Same, with a starting config (command, environment, ...).
+pub fn image_import_with(s: store::Store, tarball: string, name: string, cfg: image::ImageConfig) -> string is
+    return image::import_rootfs(s, tarball, name, cfg)
+end
+
+pub fn image_new_config() -> image::ImageConfig is
+    return image::new_config()
+end
+
+;; Writes an OCI image layout directory.
+pub fn image_export(s: store::Store, ref_text: string, directory: string) -> bool is
+    return image::export_layout(s, ref_text, directory)
+end
+
+;; Installs an image from an OCI image layout directory.
+pub fn image_load(s: store::Store, directory: string, name: string) -> string is
+    return image::import_layout(s, directory, name)
+end
+
+;; Deletes layers and blobs no image refers to.
+pub fn image_gc(s: store::Store) is
+    image::gc(s)
+end
+
+pub fn registry_login(s: store::Store, registry_host: string, user: string, password: string) -> bool is
+    return registry::login(s, registry_host, user, password)
+end
+
+pub fn registry_logout(s: store::Store, registry_host: string) -> bool is
+    return registry::logout(s, registry_host)
+end
+
+;; ── Build ────────────────────────────────────────────────────────────────────
+
+;; Builds an image from a Containerfile / Dockerfile.
+;;   containerfile  "" = <context>/Containerfile, else <context>/Dockerfile
+;;   build_args     ["NAME=value", ...]
+;;   net            network mode for RUN steps: "host" (default), "none" or "bridge"
+;; Returns the image id, or "" on failure.
+pub fn build_image(s: store::Store, context_dir: string, containerfile: string, tag: string, build_args: [string], net: string) -> string is
+    return build::build_image(s, context_dir, containerfile, tag, build_args, net)
+end
+
+;; ── Container options ────────────────────────────────────────────────────────
+;; Keys (single): name hostname workdir user network memory cpus pids shares readonly
+;;                privileged userns rm detach rootfs_dir
+;; Keys (repeatable, use add_option): env volume publish arg entrypoint cap_add cap_drop label
+;;   volume  "host-path:/in/container[:ro]"  or  "name:/in/container" (named volume)
+;;   publish "8080:80", "127.0.0.1:8080:80/udp"
+;;   network "host" | "none" | "bridge"
+;;   memory  "256m", "2g"      cpus  "0.5", "2"
+
+pub fn container_options(image_ref: string) -> runtime::Options is
+    return runtime::options(image_ref)
+end
+
+pub fn set_option(o: runtime::Options, key: string, value: string) -> runtime::Options is
+    return runtime::opt(o, key, value)
+end
+
+pub fn add_option(o: runtime::Options, key: string, value: string) -> runtime::Options is
+    return runtime::opt_add(o, key, value)
+end
+
+;; Reads an option back: the last value of `key` ("" when unset) / a true|1|yes flag.
+pub fn option_get(o: runtime::Options, key: string) -> string is
+    return runtime::opt_get(o, key)
+end
+
+pub fn option_flag(o: runtime::Options, key: string) -> bool is
+    return runtime::opt_flag(o, key)
+end
+
+;; Convenience: the command to run, replacing the image's CMD.
+pub fn set_command(o: runtime::Options, argv: [string]) -> runtime::Options is
+    let mut out: runtime::Options = o
+    let mut i: int = 0
+    while i < array_len(argv) is
+        out = runtime::opt_add(out, "arg", argv[i])
+        i += 1
+    end
+    return out
+end
+
+;; ── Containers ───────────────────────────────────────────────────────────────
+
+;; Creates (but does not start) a container. Returns its id, or "".
+pub fn container_create(s: store::Store, o: runtime::Options) -> string is
+    return runtime::create(s, o)
+end
+
+;; Starts a created / exited container.
+;;   attach=true   output goes to this terminal; returns the exit code once it ends
+;;   attach=false  output goes to the log; returns 0 as soon as it runs
+;; Returns -1 when it cannot be started.
+pub fn container_start(s: store::Store, id: string, attach: bool) -> int is
+    return runtime::start(s, id, attach)
+end
+
+;; create + start + (rm) in one call. Returns the exit code, or -1.
+;; Options "rm=true" removes the container afterwards, "detach=true" returns at once.
+pub fn container_run(s: store::Store, o: runtime::Options) -> int is
+    return runtime::run_container(s, o)
+end
+
+;; SIGTERM, then SIGKILL after timeout_seconds.
+pub fn container_stop(s: store::Store, id: string, timeout_seconds: int) -> bool is
+    return runtime::stop(s, id, timeout_seconds)
+end
+
+;; signal: "TERM", "KILL", "HUP", "USR1", ...
+pub fn container_kill(s: store::Store, id: string, signal: string) -> bool is
+    return runtime::kill(s, id, signal)
+end
+
+;; Blocks until the container exits; returns its exit code, or -1 on timeout (0 = never).
+pub fn container_wait(s: store::Store, id: string, timeout_ms: int) -> int is
+    return runtime::wait(s, id, timeout_ms)
+end
+
+;; Runs a command inside a running container. Returns its exit code (-1 when not running).
+pub fn container_exec(s: store::Store, id: string, argv: [string], extra_env: [string], user: string, workdir: string) -> int is
+    return runtime::exec(s, id, argv, extra_env, user, workdir)
+end
+
+pub fn container_remove(s: store::Store, id: string, force: bool) -> bool is
+    return runtime::remove(s, id, force)
+end
+
+pub fn container_list(s: store::Store) -> [runtime::ContainerInfo] is
+    return runtime::list(s)
+end
+
+;; Container id for an id, id prefix or name ("" when unknown).
+pub fn container_find(s: store::Store, ref_text: string) -> string is
+    return runtime::find(s, ref_text)
+end
+
+;; "created" | "running" | "exited" | "unknown"
+pub fn container_status(s: store::Store, id: string) -> string is
+    return runtime::status(s, id)
+end
+
+pub fn container_exit_code(s: store::Store, id: string) -> int is
+    return runtime::exit_code(s, id)
+end
+
+pub fn container_pid(s: store::Store, id: string) -> int is
+    return runtime::pid_of(s, id)
+end
+
+pub fn container_logs(s: store::Store, id: string) -> string is
+    return runtime::logs(s, id)
+end
+
+pub fn container_logs_tail(s: store::Store, id: string, lines: int) -> string is
+    return runtime::logs_tail(s, id, lines)
+end
+
+pub fn container_inspect(s: store::Store, id: string) -> string is
+    return runtime::inspect(s, id)
+end
+
+;; Directory holding the container's OCI bundle: config.json + rootfs/ (vfs driver),
+;; which `runc run -b <dir>` / `crun run -b <dir>` can also execute.
+pub fn container_bundle(s: store::Store, id: string) -> string is
+    return runtime::dir_of(s, id)
+end
+
+;; ── Host ─────────────────────────────────────────────────────────────────────
+
+pub fn host_info() -> host::HostInfo is
+    return host::info()
+end
+
+;; Human readable capability report (one line per check).
+pub fn doctor() -> [string] is
+    return host::doctor()
+end
